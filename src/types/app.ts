@@ -74,3 +74,9 @@ export const STATUS_COLOR: Record<ConnectionStatus, "green" | "yellow" | "red" |
 export interface AppErrorEvent {
   message: string;
 }
+
+/** clipboard-synced 事件 payload（阶段 7：远程剪贴板落地后） */
+export interface ClipboardSyncedEvent {
+  /** 落地时间（epoch 毫秒字符串，前端转本地时区展示） */
+  time: string;
+}

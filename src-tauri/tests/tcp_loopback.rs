@@ -1,11 +1,13 @@
 // 阶段 5 集成测试：本机环回（127.0.0.1 + 随机空闲端口）验证 NetworkManager 全链路。
 // 正式运行逻辑仍绑定 ZeroTier IP；此处仅测试允许使用环回地址。
 // 对端（client）用裸 TcpStream + protocol 编解码模拟，测试身份/密钥均为测试数据。
+use cliplink_lib::identity::hex_encode;
 use cliplink_lib::network::{ConnectionStatusEvent, ManagerConfig, NetworkManager, StatusSink};
 use cliplink_lib::protocol::{
-    self, DisconnectPayload, HelloPayload, Message, PingPayload, PongPayload,
+    self, ClipboardPayload, DisconnectPayload, HelloPayload, Message, PingPayload, PongPayload,
 };
 use cliplink_lib::state::ConnectionStatus;
+use sha2::{Digest, Sha256};
 use std::marker::Unpin;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -461,6 +463,138 @@ fn outbound_unreachable_fails_bounded() {
             sink.last()
         );
         assert!(!m.is_busy());
+        m.shutdown().await;
+    });
+}
+
+fn sha256_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+fn clipboard_msg_with_id(message_id: &str, text: &str) -> Message {
+    Message::new(
+        "clipboard_update",
+        PEER_DEVICE_ID,
+        &ClipboardPayload {
+            text: text.to_string(),
+            content_hash: sha256_hex(text),
+        },
+    )
+    .unwrap()
+    .with_message_id(message_id.to_string())
+}
+
+// 阶段 7：对方发送 clipboard_update → 本端校验（哈希/大小/消息 ID 去重）→ 回调落地；
+// 重复 ID 不重复落地；非法载荷不中断连接；中文/Emoji/多行文字保持不变。
+#[test]
+fn clipboard_update_flow_and_dedup() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    // 拦截落地回调：记录收到的载荷（不触碰真实系统剪贴板）
+    let landed: Arc<Mutex<Vec<ClipboardPayload>>> = Arc::new(Mutex::new(Vec::new()));
+    let landed2 = landed.clone();
+    m.set_clipboard_landing(Arc::new(move |p| {
+        landed2.lock().unwrap().push(p.clone());
+    }));
+    tauri::async_runtime::block_on(async move {
+        let (_crd, mut cwr, _addr, _paddr) = establish_inbound(&m).await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
+
+        // 中文 + Emoji + 多行：内容原样到达
+        let unicode = "你好，世界 🎉\n第二行\tTab";
+        let msg = clipboard_msg_with_id("cb-1", unicode);
+        client_send(&mut cwr, &msg).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        {
+            let got = landed.lock().unwrap();
+            assert_eq!(got.len(), 1, "应落地 1 次");
+            assert_eq!(got[0].text, unicode);
+            assert_eq!(got[0].content_hash, sha256_hex(unicode));
+        }
+
+        // 同一消息 ID 重复投递：不再落地
+        client_send(&mut cwr, &msg).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(landed.lock().unwrap().len(), 1, "重复 ID 不应再次落地");
+
+        // 不同 ID、相同内容：仍是新消息（内容哈希去重在 state 层），此处落地一次
+        let msg2 = clipboard_msg_with_id("cb-2", unicode);
+        client_send(&mut cwr, &msg2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(landed.lock().unwrap().len(), 2, "新 ID 同内容应落地");
+
+        // 非法载荷（空文本）：忽略且不中断连接
+        let bad = Message::new(
+            "clipboard_update",
+            PEER_DEVICE_ID,
+            &ClipboardPayload {
+                text: String::new(),
+                content_hash: sha256_hex(""),
+            },
+        )
+        .unwrap()
+        .with_message_id("cb-bad".to_string());
+        client_send(&mut cwr, &bad).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(landed.lock().unwrap().len(), 2, "空文本不应落地");
+        assert_eq!(
+            sink.last().unwrap().status,
+            ConnectionStatus::Connected,
+            "非法载荷不应断开连接"
+        );
+
+        // 哈希不匹配的载荷：忽略且不中断连接
+        let tampered = Message::new(
+            "clipboard_update",
+            PEER_DEVICE_ID,
+            &ClipboardPayload {
+                text: "real-content".to_string(),
+                content_hash: "deadbeef".to_string(),
+            },
+        )
+        .unwrap()
+        .with_message_id("cb-tampered".to_string());
+        client_send(&mut cwr, &tampered).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(landed.lock().unwrap().len(), 2, "哈希不匹配不应落地");
+        assert_eq!(sink.last().unwrap().status, ConnectionStatus::Connected);
+
+        m.disconnect().await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Offline).await);
+        m.shutdown().await;
+    });
+}
+
+// 阶段 7：本端 send_message 发送 clipboard_update → 对方实际收到同一内容（A→B 方向）
+#[test]
+fn outbound_clipboard_update_reaches_peer() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    tauri::async_runtime::block_on(async move {
+        let (mut crd, mut cwr, _addr, _paddr) = establish_inbound(&m).await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
+
+        let text = "A → B 同步 🎉";
+        let msg = Message::new(
+            "clipboard_update",
+            LOCAL_DEVICE_ID,
+            &ClipboardPayload {
+                text: text.to_string(),
+                content_hash: sha256_hex(text),
+            },
+        )
+        .unwrap();
+        m.send_message(&msg).unwrap();
+        // 对方读取到 clipboard_update，内容一致（期间心跳 ping 自动处理）
+        let got = client_await(&mut crd, &mut cwr, "clipboard_update").await;
+        let p: ClipboardPayload = serde_json::from_value(got.payload).unwrap();
+        assert_eq!(p.text, text);
+        assert_eq!(p.content_hash, sha256_hex(text));
+
+        m.disconnect().await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Offline).await);
         m.shutdown().await;
     });
 }

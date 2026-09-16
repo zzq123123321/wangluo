@@ -7,6 +7,7 @@ use crate::error::AppError;
 use crate::protocol;
 use crate::state::{ConnectionStatus, PeerInfo};
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,8 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 pub const STATUS_EVENT: &str = "connection-status-changed";
+/// 最近剪贴板消息 ID 去重队列上限（阶段 7，应用重启后无需保留）。
+pub const MAX_RECENT_MESSAGE_IDS: usize = 100;
 
 /// 连接状态事件 payload：只含非敏感信息（无 device_secret / shared_key / auth / 原始消息）。
 #[derive(Debug, Clone, Serialize)]
@@ -136,6 +139,10 @@ struct NetCore {
     cfg: ManagerConfig,
     sink: Arc<dyn StatusSink>,
     zt_provider: Mutex<Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>>,
+    /// 阶段 7：远程剪贴板落地回调（lib.rs 注入，负责写系统剪贴板 + 更新状态）
+    clipboard_landing: Mutex<Option<Arc<dyn Fn(&protocol::ClipboardPayload) + Send + Sync>>>,
+    /// 阶段 7：最近已处理的消息 ID（去重），上限 MAX_RECENT_MESSAGE_IDS
+    recent_message_ids: Mutex<VecDeque<String>>,
     inner: Mutex<NetInner>,
 }
 
@@ -210,6 +217,8 @@ impl NetworkManager {
                 cfg,
                 sink,
                 zt_provider: Mutex::new(None),
+                clipboard_landing: Mutex::new(None),
+                recent_message_ids: Mutex::new(VecDeque::new()),
                 inner: Mutex::new(NetInner::default()),
             }),
         }
@@ -218,6 +227,41 @@ impl NetworkManager {
     /// 注入本机 ZeroTier IP 读取器（打破 AppState 与 manager 的循环依赖，lib.rs 中设置）。
     pub fn set_zt_provider(&self, p: Arc<dyn Fn() -> Option<String> + Send + Sync>) {
         *self.core.zt_provider.lock().unwrap() = Some(p);
+    }
+
+    /// 注入远程剪贴板落地回调（阶段 7）：收到合法 clipboard_update 时调用，
+    /// 回调负责写入系统剪贴板并更新状态。贪心：协议层只做校验，落地逻辑在注入侧。
+    pub fn set_clipboard_landing(&self, f: Arc<dyn Fn(&protocol::ClipboardPayload) + Send + Sync>) {
+        *self.core.clipboard_landing.lock().unwrap() = Some(f);
+    }
+
+    /// 发送一条消息：编码后经当前活动连接的 writer 通道发送。
+    /// 无活动连接 / writer 通道已关闭返回 Err；当前仅限已连接后使用。
+    pub fn send_message(&self, msg: &protocol::Message) -> Result<(), AppError> {
+        let conn = {
+            let g = self.core.inner.lock().unwrap();
+            g.conn.as_ref().map(|s| s.conn.clone())
+        };
+        let Some(conn) = conn else {
+            return Err(AppError::ConnectionClosed);
+        };
+        let bytes = protocol::encode(msg)?;
+        conn.writer_tx
+            .send(bytes)
+            .map_err(|_| AppError::ConnectionClosed)
+    }
+
+    /// 阶段 7：消息 ID 去重。已见过的 ID 返回 true（调用方忽略该消息）；否则记录并返回 false。
+    fn is_duplicate_message(&self, message_id: &str) -> bool {
+        let mut q = self.core.recent_message_ids.lock().unwrap();
+        if q.iter().any(|id| id == message_id) {
+            return true;
+        }
+        q.push_back(message_id.to_string());
+        while q.len() > MAX_RECENT_MESSAGE_IDS {
+            q.pop_front();
+        }
+        false
     }
 
     fn zt_ip_now(&self) -> Option<String> {
@@ -758,6 +802,29 @@ impl NetworkManager {
             }
             protocol::MSG_DISCONNECT => Handled::PeerGone,
             protocol::MSG_ERROR => Handled::Fail(AppError::ConnectionClosed),
+            // 阶段 7：远程剪贴板落地。校验失败/重复 ID 只忽略不中断连接（数据面消息，非协议违规）。
+            protocol::MSG_CLIPBOARD_UPDATE => {
+                if self.is_duplicate_message(&msg.message_id) {
+                    tracing::debug!(gen = conn.generation, "重复剪贴板消息 ID，忽略");
+                    return Handled::Continue;
+                }
+                match protocol::validate_clipboard(msg) {
+                    Ok(payload) => {
+                        if let Some(f) = self.core.clipboard_landing.lock().unwrap().as_ref() {
+                            f(&payload);
+                        }
+                        Handled::Continue
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            gen = conn.generation,
+                            code = e.code(),
+                            "非法剪贴板消息，忽略"
+                        );
+                        Handled::Continue
+                    }
+                }
+            }
             _ => {
                 tracing::debug!(gen = conn.generation, t = %msg.msg_type, "未知消息类型，忽略");
                 Handled::Continue
@@ -998,6 +1065,27 @@ mod tests {
         let (p4, t4) = hb.on_tick();
         assert!(t4);
         assert!(p4.is_none());
+    }
+
+    // 阶段 7：消息 ID 去重——同一 ID 只允许处理一次，队列上限封顶
+    #[test]
+    fn duplicate_message_ids_dropped() {
+        let (m, _) = test_manager();
+        assert!(!m.is_duplicate_message("id-1"));
+        assert!(m.is_duplicate_message("id-1"), "重复 ID 应被拒绝");
+        // 填满队列后最旧的被淘汰：id-1 被弹出，可再次入队
+        for i in 0..MAX_RECENT_MESSAGE_IDS {
+            m.is_duplicate_message(&format!("gen-{i}"));
+        }
+        assert!(
+            !m.is_duplicate_message("id-1"),
+            "队列淘汰后旧 ID 不再命中（环形去重）"
+        );
+        assert_eq!(
+            m.core.recent_message_ids.lock().unwrap().len(),
+            MAX_RECENT_MESSAGE_IDS,
+            "去重队列应保持上限"
+        );
     }
 
     // 36/37/38/39/40：输入校验

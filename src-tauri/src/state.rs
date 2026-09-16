@@ -38,6 +38,9 @@ pub struct Inner {
     pub last_clipboard_hash: Option<String>,
     /// 阶段 6：本机剪贴板最新文字（供阶段 7 发送）
     pub last_clipboard_text: Option<String>,
+    /// 阶段 7：最近一次远程写入本机剪贴板的哈希标记。
+    /// 剪贴板轮询检测到与本标记相同的哈希时视为远程内容回显，不发送回对端。
+    pub last_remote_hash: Option<String>,
 }
 
 /// 完整配置（含 device_secret 等敏感字段）只在 Rust 侧持有；

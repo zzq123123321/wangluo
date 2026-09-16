@@ -5,8 +5,9 @@
 // 未知消息类型：解码不失败，由调用方安全忽略（不崩溃）。
 // 本模块只负责协议数据结构、编码、解码和校验；连接生命周期见 network.rs。
 use crate::error::AppError;
-use crate::identity::DEVICE_NAME_MAX_LEN;
+use crate::identity::{hex_encode, DEVICE_NAME_MAX_LEN};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
@@ -19,6 +20,7 @@ pub const MSG_PING: &str = "ping";
 pub const MSG_PONG: &str = "pong";
 pub const MSG_DISCONNECT: &str = "disconnect";
 pub const MSG_ERROR: &str = "error";
+pub const MSG_CLIPBOARD_UPDATE: &str = "clipboard_update";
 
 pub const REASON_USER_REQUESTED: &str = "user_requested";
 pub const REASON_SHUTDOWN: &str = "shutdown";
@@ -57,6 +59,14 @@ pub struct ErrorPayload {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardPayload {
+    /// 同步的剪贴板文字（已验证 ≤1 MiB、非空）
+    pub text: String,
+    /// text 的 SHA-256 hex：接收端校验完整性，非对端篡改
+    pub content_hash: String,
+}
+
 /// 公共消息结构。`type`/`payload` 保留为原始值：
 /// 未知消息类型与未知字段都能安全解码，由调用方决定忽略。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +98,12 @@ impl Message {
             payload,
             auth: None,
         })
+    }
+
+    /// 置入固定 message_id（去重/重放测试用；生产消息由 new 自动生成 UUID）。
+    pub fn with_message_id(mut self, id: String) -> Self {
+        self.message_id = id;
+        self
     }
 }
 
@@ -174,6 +190,31 @@ pub fn validate_hello(msg: &Message, local_device_id: &str) -> Result<HelloPaylo
         return Err(AppError::InvalidHello);
     }
     Ok(payload)
+}
+
+/// 校验 clipboard_update 消息：text 非空、不超 1 MiB、content_hash 为 text 的合法 SHA-256 hex。
+pub fn validate_clipboard(msg: &Message) -> Result<ClipboardPayload, AppError> {
+    if msg.version != PROTOCOL_VERSION {
+        return Err(AppError::ProtocolVersionMismatch);
+    }
+    if msg.msg_type != MSG_CLIPBOARD_UPDATE {
+        return Err(AppError::ProtocolInvalidJson);
+    }
+    let p: ClipboardPayload =
+        serde_json::from_value(msg.payload.clone()).map_err(|_| AppError::ProtocolInvalidJson)?;
+    if p.text.is_empty() {
+        return Err(AppError::ProtocolInvalidJson);
+    }
+    if p.text.len() > MAX_MESSAGE_BYTES as usize {
+        return Err(AppError::ProtocolMessageTooLarge);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(p.text.as_bytes());
+    let actual = hex_encode(&hasher.finalize());
+    if !p.content_hash.eq_ignore_ascii_case(&actual) {
+        return Err(AppError::ProtocolInvalidJson);
+    }
+    Ok(p)
 }
 
 #[cfg(test)]
@@ -279,6 +320,25 @@ mod tests {
         .unwrap()
     }
 
+    fn clipboard_msg(text: &str, hash: &str) -> Message {
+        Message::new(
+            MSG_CLIPBOARD_UPDATE,
+            LOCAL_ID,
+            &ClipboardPayload {
+                text: text.into(),
+                content_hash: hash.into(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// 与发送端相同方式计算 SHA-256 hex（用于构建合法校验 payload）。
+    fn sha256_hex(text: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(text.as_bytes());
+        hex_encode(&hasher.finalize())
+    }
+
     // 1/2/3/4：hello / ping / pong / disconnect 正常往返（分片读取）
     #[test]
     fn roundtrip_all_message_types() {
@@ -319,7 +379,50 @@ mod tests {
         assert_eq!(&bytes[4..], &serde_json::to_vec(&m).unwrap()[..]);
     }
 
-    // 6：TCP 分片（长度头被拆开、正文逐字节）read_exact 仍能正确读取
+    // 1/6：clipboard_update 消息加后缀时文本不变（分片往返 + 校验）
+    #[test]
+    fn clipboard_roundtrip_and_validate() {
+        let rt = runtime();
+        let m = clipboard_msg(
+            "你好，世界 🎉\n第二行",
+            &sha256_hex("你好，世界 🎉\n第二行"),
+        );
+        let bytes = encode(&m).unwrap();
+        rt.block_on(async {
+            let mut r = FragReader::new(bytes, 3);
+            let got = read_message(&mut r).await.unwrap();
+            assert_eq!(got.msg_type, MSG_CLIPBOARD_UPDATE);
+            let p = validate_clipboard(&got).unwrap();
+            assert_eq!(p.text, "你好，世界 🎉\n第二行");
+            assert_eq!(p.content_hash, sha256_hex("你好，世界 🎉\n第二行"));
+        });
+    }
+
+    // 阶段 7：空文本 / 超 1 MiB / 类型不匹配 / 哈希不匹配均被拒绝
+    #[test]
+    fn clipboard_validation_rejects_bad_input() {
+        assert!(matches!(
+            validate_clipboard(&clipboard_msg("hello", &sha256_hex("hello"))),
+            Ok(p) if p.text == "hello"
+        ));
+        // 空文本
+        let e = validate_clipboard(&clipboard_msg("", &sha256_hex(""))).unwrap_err();
+        assert_eq!(e.code(), AppError::ProtocolInvalidJson.code());
+        // 超 1 MiB 文本
+        let big = "x".repeat(MAX_MESSAGE_BYTES as usize + 1);
+        let e = validate_clipboard(&clipboard_msg(&big, &sha256_hex(&big))).unwrap_err();
+        assert_eq!(e.code(), AppError::ProtocolMessageTooLarge.code());
+        // 空 content_hash
+        let e = validate_clipboard(&clipboard_msg("hello", "")).unwrap_err();
+        assert_eq!(e.code(), AppError::ProtocolInvalidJson.code());
+        // content_hash 与实际 SHA-256 不匹配
+        let e = validate_clipboard(&clipboard_msg("hello", "not-a-hash")).unwrap_err();
+        assert_eq!(e.code(), AppError::ProtocolInvalidJson.code());
+        // 类型必须是 clipboard_update
+        let ping = ping_msg();
+        let e = validate_clipboard(&ping).unwrap_err();
+        assert_eq!(e.code(), AppError::ProtocolInvalidJson.code());
+    }
     #[test]
     fn fragmented_reads_succeed() {
         let bytes = encode(&hello_msg()).unwrap();

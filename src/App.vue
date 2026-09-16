@@ -6,12 +6,28 @@ import LocalAddressCard from "./components/LocalAddressCard.vue";
 import ConnectCard from "./components/ConnectCard.vue";
 import PeerStatusCard from "./components/PeerStatusCard.vue";
 import { store, refreshSnapshot, updateSettings } from "./stores/app";
-import { STATUS_TEXT, type ConnectionStatusEvent, type ZtIpChangedEvent, type AppErrorEvent } from "./types/app";
+import {
+  STATUS_TEXT,
+  type ConnectionStatusEvent,
+  type ZtIpChangedEvent,
+  type AppErrorEvent,
+  type ClipboardSyncedEvent,
+} from "./types/app";
 import type { DemoKey } from "./stores/demo";
 
 const dev = import.meta.env.DEV;
 
 const DevSwitcher = ref<Component | null>(null);
+
+/** 格式化最近同步时间（epoch ms 字符串 → 本地 HH:MM:SS） */
+function formatSync(ms: string | null): string {
+  if (!ms) return "暂无";
+  try {
+    return new Date(Number(ms)).toLocaleTimeString();
+  } catch {
+    return "暂无";
+  }
+}
 
 async function onAutostartChange(e: Event) {
   if (!store.loaded) return;
@@ -52,6 +68,11 @@ onMounted(async () => {
       if (store.demoState) return;
       store.error = ev.payload.message;
     });
+    // 阶段 7：远程剪贴板落地后更新“最近同步”时间
+    await listen<ClipboardSyncedEvent>("clipboard-synced", (ev) => {
+      if (store.demoState) return;
+      store.lastSync = ev.payload.time;
+    });
   } catch {
     // 普通浏览器无 Tauri 运行时：无事件通道，开发页靠 demo 状态预览
   }
@@ -67,7 +88,7 @@ onMounted(async () => {
     <PeerStatusCard />
     <div class="foot">
       <div class="last-sync">
-        最近同步：{{ store.lastSync ?? "暂无" }}
+        最近同步：{{ formatSync(store.lastSync) }}
       </div>
       <div class="foot-row">
         <label class="check">

@@ -2,7 +2,7 @@ mod clipboard;
 mod commands;
 pub mod config;
 pub mod error;
-mod identity;
+pub mod identity;
 pub mod network;
 pub mod protocol;
 pub mod state;
@@ -57,6 +57,12 @@ pub fn run() {
             let state_ref = state.clone();
             net.set_zt_provider(Arc::new(move || {
                 state_ref.inner.lock().ok()?.zerotier_ip.clone()
+            }));
+            // 阶段 7：远程剪贴板落地回调（写系统剪贴板 + 更新状态 + 前端同步事件）
+            let state_for_landing = state.clone();
+            let app_for_landing = app.handle().clone();
+            net.set_clipboard_landing(Arc::new(move |payload| {
+                clipboard::land_remote(state_for_landing.clone(), app_for_landing.clone(), payload);
             }));
             let state_for_clipboard = state.clone();
             app.manage(state);

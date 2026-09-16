@@ -14,7 +14,7 @@
 | 阶段 4 | 配置和设备身份 | ✅ 完成（2026-09-16） |
 | 阶段 5 | TCP 通信基础 | ✅ 完成（2026-09-16） |
 | 阶段 6 | 单机剪贴板监听 | ✅ 完成（2026-09-16） |
-| 阶段 7 | 双向同步 | ⬜ 未开始 |
+| 阶段 7 | 双向同步 | ✅ 完成（2026-09-17） |
 | 阶段 8 | 自动重连和冲突处理 | ⬜ 未开始 |
 | 阶段 9 | 托盘和开机启动 | ⬜ 未开始 |
 | 阶段 10 | 安装包和防火墙 | ⬜ 未开始 |
@@ -185,6 +185,24 @@
 - dark-connected / dark-awaiting_pairing / dark-error
 - prod-check（生产构建，验证无开发按钮）
 
+## 阶段 7 完成记录（2026-09-17）
+
+- **clipboard_update 协议**（protocol.rs）：`MSG_CLIPBOARD_UPDATE` 类型 + `ClipboardPayload { text, content_hash }`。`validate_clipboard`：版本/类型/消息 ID/文本非空且 ≤ 1 MiB（`MAX_MESSAGE_BYTES`），并校验 `content_hash` == 本地对 text 的 SHA-256（**防篡改/校验和**）。`Message::with_message_id()` 供测试注入指定 message_id（去重测试用）。
+- **网络层去重**（network.rs）：`NetCore` 新增 `recent_message_ids: VecDeque<Uuid>`（上限 `MAX_RECENT_MESSAGE_IDS=100`，超限淘汰最旧）；`is_duplicate_message`：空队列记录即插入返回 false，已存在返回 true，未满则追加。`handle_message` 中 `MSG_CLIPBOARD_UPDATE` 分支：**重复 message_id 直接丢弃**（`message_id_duplicate` 记录忽略，不视为协议错误不断连）；`validate_clipboard` 失败（非法/篡改）→ `tracing::warn` 后忽略（不断连）；合法则经 `clipboard_landing` 回调交给上层（AppState 持有）。
+- **剪贴板落地**（clipboard.rs）：`land_remote(state, app, text, content_hash)`——**防回传顺序**：① 设置 `last_remote_hash`（远程写入标记）→ ② 写系统剪贴板（arboard）→ ③ 更新 `last_clipboard_hash/text` → ④ 清空标记 → ⑤ 更新 `last_sync` → ⑥ emit `clipboard-synced` 事件。轮询线程（阶段 6）每轮 `classify_change`：hash 与 `last_clipboard_hash` 相同 → `Unchanged` 跳过；**内容与 `last_remote_hash` 相同 → `RemoteEcho`（自己刚落地的远程内容）吸收不回传**；否则 `LocalChange` → `send_update`。
+- **发送侧**（clipboard.rs `send_update`）：仅 `status == Connected` 时经 `net.send_message` 发送 `clipboard_update{text, content_hash}`；未连接/未握手完成时**静默吸收**（文档"旧内容不补发"策略）；发送成功更新 `last_clipboard_hash/text`。文本 ≤ 1 MiB（复用阶段 6 超限逻辑）。
+- **状态接线**（state.rs / lib.rs）：`Inner` 新增 `last_remote_hash: Option<String>`；lib.rs 注入 `net_clipboard_landing`（`NetCore.clipboard_landing` = 包一层 AppState 的 closure，`set_clipboard_landing` 设置）；`SendMessageError::NotConnected` → 静默忽略（未连接此刻不应发送）。
+- **前端**：`types/app.ts` 新增 `ClipboardSyncedEvent { time }`；`App.vue` 监听 `clipboard-synced` 事件更新 `store.lastSync`（epoch 毫秒 → 本地时间格式化 `formatSync()`），快照已含 last_sync。
+- **测试**：`cargo test` 共 **68 单元 + 11 集成 = 79/79 通过**（集成测试 `--test-threads=1` 串行跑全绿）。新增：
+  - 单元：`classify_change` 三例（unchanged/remote_echo/local_change）、`sha256_hex` 校验、文本超限、`validate_clipboard` 接受/篡改 hash 拒绝/空文本拒绝。
+  - 集成（tests/tcp_loopback.rs）：`clipboard_update_flow_and_dedup`（A 收 B 的 clipboard_update → 落地 + `clipboard-synced` 事件 + `last_sync` 更新；重复 message_id 不重复落地；篡改 hash 的帧被忽略且连接不断；新 message_id 同内容可再次落地）；`outbound_clipboard_update_reaches_peer`（A 经 `send_message` 发出 → B 收到同 text + 正确 hash）。
+- **已知 flaky（前阶段遗留，非本次回归）**：`outbound_connect_and_user_disconnect` 在并行跑时偶发（读侧 EOF 早于期待 frame），单独/串行跑必过（阶段 6 已记录；环境负载相关，整机同时 11 条真实 socket 测试）。
+- **构建**：`npm run build`（vue-tsc + vite）通过（修复 `App.vue` 未使用 `computed` import 的 TS6133）；cargo fmt 已跑。
+- **遗留**：
+  - 冲突/回传并发边界：发送侧未做「正在落地远程内容时本地同时复制」的锁协调（阶段 8 冲突处理范围）。
+  - 集成测试仅覆盖 A→B 单方向落地链路；双机坐实需 4090 装 ClipLink 后（阶段 11 测试录）。
+  - 阶段 6 提交 `2271036` + 阶段 7 新提交仍本地未推送（GitHub 443 不可达，网络恢复后 `git push origin main`）。
+
 ## 已知问题 / 待办
 
 - 开机启动复选框已持久化偏好值（阶段 4）；系统开机启动插件与"打开设置"按钮留阶段 9。
@@ -192,10 +210,8 @@
 - 两机真实互连（本机 + 4090）待 4090 装 ClipLink 后验证（见阶段 5 遗留）。
 - "未发现 ZeroTier IP"的真实运行场景未实测（本机 LLM API 依赖 ZT，见决策 14）；由单测覆盖，后续可在 4090 主机（不依赖 ZT 跑 LLM）上补测。
 
-## 下一步（阶段 6：首次配对）
+## 下一步（阶段 8：自动重连和冲突处理）
 
-1. 双方 hello 交换后生成配对确认码（基于双方 device_secret 的共享材料，见开发文档第 11 节算法），UI 显示六位确认码（`pairing_code` 进入 AppSnapshot/事件）。
-2. `approve_pairing` / `reject_pairing` 命令：确认后保存 `paired_peer { device_id, device_name, ip, shared_key }`（shared_key 由双方 secret 派生，仅存 Rust 侧配置），进入 Connected；拒绝则断开并清理。
-3. PairingDialog 启用"允许并记住/拒绝"按钮；确认码不一致时给出明确提示。
-4. 配对后重连走阶段 7 的认证（shared_key + auth 字段），阶段 6 只负责"首次"。
-5. 完成标准：两机首次配对成功（确认码一致→Connected）、拒绝后回到未配对状态、配对信息持久化且 secret 不泄漏。
+1. 自动重连：断线（心跳超时/连接错误）后按 `last_peer_ip` 自动重连，限次/退避策略。
+2. 冲突处理：双向同时复制冲突时的策略（如最后一次写入胜出）；落地期间本地复制与远程落地的并发边界。
+3. 重连期间剪贴板变化的缓存/丢弃策略。
