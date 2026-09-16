@@ -9,14 +9,13 @@ pub enum ConnectionStatus {
     #[default]
     Offline,
     Connecting,
-    AwaitingPairing,
     Connected,
     Reconnecting,
     Paused,
     Error,
 }
 
-/// 运行期对方信息（阶段 5 连接成功后更新）；也用作 paired_peer 的非敏感摘要（不含 shared_key）。
+/// 运行期对方信息（连接建立后更新，非敏感）。
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerInfo {
     pub device_name: String,
@@ -33,7 +32,6 @@ pub struct Inner {
     pub peer: Option<PeerInfo>,
     pub paused: bool,
     pub last_sync: Option<String>,
-    pub pairing_code: Option<String>,
     /// 已保存的对方 IP（来自配置，供前端输入框回显）
     pub last_peer_ip: Option<String>,
 }
@@ -58,10 +56,6 @@ impl AppState {
             status_text: crate::zerotier::HINT_DETECTING.to_string(),
             paused: config.sync_paused,
             last_peer_ip: config.last_peer_ip.clone(),
-            peer: config.paired_peer.as_ref().map(|p| PeerInfo {
-                device_name: p.device_name.clone(),
-                ip: p.ip.clone(),
-            }),
             ..Inner::default()
         };
         Self {

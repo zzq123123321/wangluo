@@ -9,22 +9,9 @@ pub const CONFIG_FILE: &str = "config.json";
 pub const SCHEMA_VERSION: u32 = 1;
 /// 默认监听端口：当前版本固定 45888/TCP。
 pub const DEFAULT_LISTEN_PORT: u16 = 45888;
-/// shared_key 长度（字节）：阶段 6 配对后生成，本阶段保持 null。
-pub const SHARED_KEY_LEN: usize = 32;
-
-/// 配对对方信息（预留结构）：阶段 6 用户允许配对后才生成并保存；之前恒为 null，
-/// 不得在首次启动时生成 shared_key。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PairedPeer {
-    pub device_id: String,
-    pub device_name: String,
-    pub ip: String,
-    /// 共享密钥（小写十六进制）；敏感材料：不得进入日志/前端/事件
-    pub shared_key: String,
-}
 
 /// 应用配置。schema_version 必须存在；缺失的非关键字段由 serde 默认值补齐（前向兼容），
-/// 出现但语义无效的关键字段（端口 0、非法 IPv4、无效身份/配对）整体按损坏配置处理。
+/// 出现但语义无效的关键字段（端口 0、非法 IPv4、无效身份）整体按损坏配置处理。
 /// 未知字段：serde 默认策略为忽略（低版本读取高版本新增字段不报错）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -37,8 +24,6 @@ pub struct AppConfig {
     pub sync_paused: bool,
     #[serde(default)]
     pub last_peer_ip: Option<String>,
-    #[serde(default)]
-    pub paired_peer: Option<PairedPeer>,
     pub identity: LocalIdentity,
 }
 
@@ -55,7 +40,6 @@ impl AppConfig {
             autostart: false,
             sync_paused: false,
             last_peer_ip: None,
-            paired_peer: None,
             identity: identity::new_identity(),
         }
     }
@@ -68,26 +52,6 @@ impl AppConfig {
         if let Some(ip) = &self.last_peer_ip {
             if !is_valid_ipv4_str(ip) {
                 return Err(AppError::new(format!("last_peer_ip 不是有效 IPv4: {ip}")));
-            }
-        }
-        if let Some(peer) = &self.paired_peer {
-            uuid::Uuid::parse_str(&peer.device_id)
-                .map_err(|_| AppError::new("paired_peer.device_id 不是有效 UUID"))?;
-            if peer.device_name.trim().is_empty() {
-                return Err(AppError::new("paired_peer.device_name 不能为空"));
-            }
-            if !is_valid_ipv4_str(&peer.ip) {
-                return Err(AppError::new(format!(
-                    "paired_peer.ip 不是有效 IPv4: {}",
-                    peer.ip
-                )));
-            }
-            let key = identity::hex_decode(&peer.shared_key)?;
-            if key.len() != SHARED_KEY_LEN {
-                return Err(AppError::new(format!(
-                    "paired_peer.shared_key 解码后应为 {SHARED_KEY_LEN} 字节，实际 {}",
-                    key.len()
-                )));
             }
         }
         identity::validate_identity(&self.identity)
@@ -295,7 +259,7 @@ mod tests {
         assert_eq!(second.identity.device_secret, first.identity.device_secret);
     }
 
-    // 默认 listen_port = 45888；默认 paired_peer / last_peer_ip 为 null
+    // 默认 listen_port = 45888；默认 last_peer_ip 为 null
     #[test]
     fn defaults() {
         let c = AppConfig::new();
@@ -303,7 +267,6 @@ mod tests {
         assert_eq!(c.schema_version, 1);
         assert!(!c.autostart);
         assert!(!c.sync_paused);
-        assert!(c.paired_peer.is_none());
         assert!(c.last_peer_ip.is_none());
     }
 
@@ -441,13 +404,7 @@ mod tests {
         let dir = tmp_dir();
         let cfg = AppConfig::new();
         let mut v = serde_json::to_value(&cfg).unwrap();
-        for k in [
-            "listen_port",
-            "autostart",
-            "sync_paused",
-            "last_peer_ip",
-            "paired_peer",
-        ] {
+        for k in ["listen_port", "autostart", "sync_paused", "last_peer_ip"] {
             v.as_object_mut().unwrap().remove(k);
         }
         std::fs::write(dir.join(CONFIG_FILE), serde_json::to_string(&v).unwrap()).unwrap();
@@ -456,24 +413,6 @@ mod tests {
         assert!(!loaded.autostart);
         assert!(!loaded.sync_paused);
         assert!(loaded.last_peer_ip.is_none());
-        assert!(loaded.paired_peer.is_none());
-    }
-
-    // paired_peer 存在时可正常往返序列化（仅用测试密钥）
-    #[test]
-    fn paired_peer_roundtrip_with_test_keys() {
-        let dir = tmp_dir();
-        let store = ConfigStore::new(dir.clone());
-        let mut cfg = store.load().unwrap();
-        cfg.paired_peer = Some(PairedPeer {
-            device_id: uuid::Uuid::new_v4().to_string(),
-            device_name: "TEST-PEER".into(),
-            ip: "10.147.17.36".into(),
-            shared_key: identity::hex_encode(&[0xcd; SHARED_KEY_LEN]),
-        });
-        store.save(&cfg).unwrap();
-        let re = ConfigStore::new(dir).load().unwrap();
-        assert_eq!(re.paired_peer, cfg.paired_peer.clone());
     }
 
     // 并发保存（专用锁串行化）后文件仍可解析，无半截 JSON

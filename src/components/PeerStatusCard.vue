@@ -10,13 +10,12 @@ const borderTone = computed(() => {
   return "busy";
 });
 
-/** 仅 connected/paused 才称“已连接”；建立中/等待配对/出错显示“对方设备” */
+/** 仅 connected/paused 才称“已连接”；建立中/出错显示“对方设备” */
 const headerLabel = computed(
   () => (store.status === "connected" || store.status === "paused" ? "已连接：" : "对方设备：")
 );
 
 const detailText = computed(() => {
-  if (store.status === "awaiting_pairing") return "等待配对确认";
   if (store.paused) return "已暂停同步";
   if (store.status === "connected") return "剪贴板同步已开启";
   if (store.status === "error") return store.statusText;
@@ -97,7 +96,6 @@ function onDisconnect() {
 }
 .dot.connected { background: var(--green); }
 .dot.reconnecting,
-.dot.connecting,
-.dot.awaiting_pairing { background: var(--yellow); }
+.dot.connecting { background: var(--yellow); }
 .dot.error { background: var(--red); }
 </style>

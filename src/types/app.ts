@@ -1,7 +1,6 @@
 export type ConnectionStatus =
   | "offline"
   | "connecting"
-  | "awaiting_pairing"
   | "connected"
   | "reconnecting"
   | "paused"
@@ -56,7 +55,6 @@ export type ZtRefreshResult = "found" | "no_adapter" | "no_valid_ipv4";
 export const STATUS_TEXT: Record<ConnectionStatus, string> = {
   offline: "未连接",
   connecting: "正在连接对方……",
-  awaiting_pairing: "等待对方确认配对……",
   connected: "已连接，剪贴板同步已开启",
   reconnecting: "连接已中断，正在重试……",
   paused: "已暂停同步",
@@ -66,7 +64,6 @@ export const STATUS_TEXT: Record<ConnectionStatus, string> = {
 export const STATUS_COLOR: Record<ConnectionStatus, "green" | "yellow" | "red" | "gray"> = {
   connected: "green",
   connecting: "yellow",
-  awaiting_pairing: "yellow",
   reconnecting: "yellow",
   error: "red",
   offline: "gray",

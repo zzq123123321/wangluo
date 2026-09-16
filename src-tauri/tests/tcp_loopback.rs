@@ -151,7 +151,7 @@ async fn establish_inbound(
 }
 
 // 1/2/3：listener 与 client 建立 TCP，双方交换 hello，双方获得对方设备摘要；
-// ping/pong 正常；hello 成功后进入 AwaitingPairing（而非 Connected）。
+// ping/pong 正常；hello 成功后进入 Connected。
 #[test]
 fn inbound_hello_ping_pong() {
     let sink = Arc::new(CollectSink::new());
@@ -160,17 +160,17 @@ fn inbound_hello_ping_pong() {
         let (mut crd, mut cwr, laddr, paddr) = establish_inbound(&m).await;
         assert!(
             wait_for(&sink, |e| {
-                e.status == ConnectionStatus::AwaitingPairing
+                e.status == ConnectionStatus::Connected
                     && e.peer.as_ref().is_some_and(|p| {
                         p.device_name == "TEST-PEER-B" && p.ip == paddr.to_string()
                     })
             })
             .await,
-            "未进入 AwaitingPairing: {:?}",
+            "未进入 Connected: {:?}",
             sink.last()
         );
         let ev = sink.last().unwrap();
-        assert_ne!(ev.status, ConnectionStatus::Connected);
+        assert_eq!(ev.status, ConnectionStatus::Connected);
 
         // 客户端 ping → 管理端返回对应 pong
         client_send(
@@ -191,7 +191,7 @@ fn inbound_hello_ping_pong() {
         assert_eq!(pp.ping_id, "it-ping-1");
         assert_eq!(pp.sent_at, 1789550000000);
 
-        // 管理端心跳 ping → 客户端回 pong，连接保持 AwaitingPairing
+        // 管理端心跳 ping → 客户端回 pong，连接保持 Connected
         let hp = client_await(&mut crd, &mut cwr, "ping").await;
         let p: PingPayload = serde_json::from_value(hp.payload).unwrap();
         client_send(
@@ -208,10 +208,7 @@ fn inbound_hello_ping_pong() {
         )
         .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            sink.last().unwrap().status,
-            ConnectionStatus::AwaitingPairing
-        );
+        assert_eq!(sink.last().unwrap().status, ConnectionStatus::Connected);
 
         // 对方正常 disconnect → 本端退出（Offline，对方已断开）
         client_send(
@@ -258,7 +255,7 @@ fn outbound_connect_and_user_disconnect() {
         client_send(&mut cwr, &peer_hello()).await;
         assert!(
             wait_for(&sink, |e| {
-                e.status == ConnectionStatus::AwaitingPairing
+                e.status == ConnectionStatus::Connected
                     && e.peer
                         .as_ref()
                         .is_some_and(|p| p.device_name == "TEST-PEER-B")
@@ -290,7 +287,7 @@ fn overlong_frame_closes_connection() {
     let m = test_manager(sink.clone());
     tauri::async_runtime::block_on(async move {
         let (crd, mut cwr, addr, _paddr) = establish_inbound(&m).await;
-        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::AwaitingPairing).await);
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
         let mut frame = vec![0x00, 0x10, 0x00, 0x01]; // 长度 = 1 MiB + 1
         frame.push(b'x'); // 正文不完整也没关系：长度先被拒绝
         cwr.write_all(&frame).await.unwrap();
@@ -316,7 +313,7 @@ fn invalid_json_and_utf8_no_crash() {
     let m = test_manager(sink.clone());
     tauri::async_runtime::block_on(async move {
         let (_crd, mut cwr, _addr, _paddr) = establish_inbound(&m).await;
-        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::AwaitingPairing).await);
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
         let body = b"this is not json";
         let mut frame = Vec::new();
         frame.extend_from_slice(&((body.len() as u32).to_be_bytes()));
@@ -335,7 +332,7 @@ fn invalid_json_and_utf8_no_crash() {
     let m2 = test_manager(sink2.clone());
     tauri::async_runtime::block_on(async move {
         let (_crd, mut cwr, _addr, _paddr) = establish_inbound(&m2).await;
-        assert!(wait_for(&sink2, |e| e.status == ConnectionStatus::AwaitingPairing).await);
+        assert!(wait_for(&sink2, |e| e.status == ConnectionStatus::Connected).await);
         let mut frame = vec![0, 0, 0, 3, 0xFF, 0xFE, 0xFD];
         cwr.write_all(&mut frame).await.unwrap();
         assert!(
@@ -396,7 +393,7 @@ fn peer_socket_close_detected() {
     let m = test_manager(sink.clone());
     tauri::async_runtime::block_on(async move {
         let (_crd, cwr, _addr, _paddr) = establish_inbound(&m).await;
-        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::AwaitingPairing).await);
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
         drop(cwr);
         drop(_crd);
         assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Error).await);
@@ -412,7 +409,7 @@ fn inbound_rejected_when_active() {
     let m = test_manager(sink.clone());
     tauri::async_runtime::block_on(async move {
         let (_crd, _cwr, addr, _paddr) = establish_inbound(&m).await;
-        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::AwaitingPairing).await);
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
         // 第二个 client 连接 → 被管理端立即关闭
         let second = TcpStream::connect(addr).await.unwrap();
         let (mut srd, _swr) = second.into_split();

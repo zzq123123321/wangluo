@@ -62,8 +62,7 @@ const dotClass = computed(() => `dot ${STATUS_COLOR[store.status]}`);
 }
 .state-text[data-status="connected"] { color: var(--green); }
 .state-text[data-status="reconnecting"],
-.state-text[data-status="connecting"],
-.state-text[data-status="awaiting_pairing"] { color: var(--yellow); }
+.state-text[data-status="connecting"] { color: var(--yellow); }
 .state-text[data-status="error"] { color: var(--red); }
 .dot {
   width: 10px;

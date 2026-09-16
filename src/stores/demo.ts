@@ -6,7 +6,6 @@ type DemoKey =
   | "no_zerotier"
   | "waiting_input"
   | "connecting"
-  | "awaiting_pairing"
   | "connected"
   | "paused"
   | "reconnecting"
@@ -24,7 +23,6 @@ interface DemoState {
   peerIp?: string;
   paused?: boolean;
   lastSync?: string | null;
-  pairingCode?: string | null;
 }
 
 // 状态文字与 docs/开发文档.md 第 3 节"必须提供的状态文字"逐字一致
@@ -62,16 +60,6 @@ export const DEMO_STATES: Record<DemoKey, DemoState> = {
     hint: "ZeroTier 已连接",
     peerDeviceName: "DESKTOP-B",
     peerIp: "10.147.17.36",
-  },
-  awaiting_pairing: {
-    label: "等待配对确认",
-    status: "awaiting_pairing",
-    statusText: "等待对方确认配对……",
-    zerotierIp: "192.168.191.180",
-    hint: "ZeroTier 已连接",
-    peerDeviceName: "DESKTOP-B",
-    peerIp: "10.147.17.36",
-    pairingCode: "483920",
   },
   connected: {
     label: "已连接",
@@ -127,11 +115,9 @@ export function applyDemo(key: DemoKey) {
   store.peerIp = d.peerIp ?? null;
   store.paused = d.paused ?? false;
   store.lastSync = d.lastSync ?? null;
-  store.pairingCode = d.pairingCode ?? null;
   store.error = null;
 }
 
 export function clearDemo() {
   store.demoState = null;
-  store.pairingCode = null;
 }

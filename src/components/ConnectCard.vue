@@ -8,7 +8,7 @@ const notice = ref("");
 const connectDisabled = computed(
   () =>
     !!store.demoState ||
-    ["connecting", "awaiting_pairing", "connected", "reconnecting", "paused"].includes(
+    ["connecting", "connected", "reconnecting", "paused"].includes(
       store.status
     )
 );
@@ -37,7 +37,7 @@ async function save() {
         @blur="save"
         @keyup.enter="save"
       />
-      <button :disabled="connectDisabled" @click="connect">连接并配对</button>
+      <button :disabled="connectDisabled" @click="connect">连接</button>
     </div>
     <div v-if="notice" class="hint warn">{{ notice }}</div>
   </section>

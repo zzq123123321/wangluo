@@ -5,7 +5,6 @@ import StatusBanner from "./components/StatusBanner.vue";
 import LocalAddressCard from "./components/LocalAddressCard.vue";
 import ConnectCard from "./components/ConnectCard.vue";
 import PeerStatusCard from "./components/PeerStatusCard.vue";
-import PairingDialog from "./components/PairingDialog.vue";
 import { store, refreshSnapshot, updateSettings } from "./stores/app";
 import { STATUS_TEXT, type ConnectionStatusEvent, type ZtIpChangedEvent } from "./types/app";
 import type { DemoKey } from "./stores/demo";
@@ -80,7 +79,6 @@ onMounted(async () => {
         <button class="link" disabled title="阶段 11 实现">打开设置</button>
       </div>
     </div>
-    <PairingDialog />
   </main>
 </template>
 

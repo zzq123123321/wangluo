@@ -48,7 +48,10 @@ impl TauriStatusSink {
 impl StatusSink for TauriStatusSink {
     fn on_status(&self, ev: &ConnectionStatusEvent) {
         // 单一状态出口：先写 AppState.inner，再 emit 事件；前端快照与事件一致。
-        if let Some(state) = self.app.try_state::<std::sync::Arc<crate::state::AppState>>() {
+        if let Some(state) = self
+            .app
+            .try_state::<std::sync::Arc<crate::state::AppState>>()
+        {
             if let Ok(mut g) = state.inner.lock() {
                 g.status = ev.status;
                 g.status_text = ev.status_text.clone();
@@ -309,40 +312,40 @@ impl NetworkManager {
     async fn accept_loop(&self, listener: TcpListener, cancel: CancellationToken) {
         loop {
             tokio::select! {
-                _ = cancel.cancelled() => break,
-                res = listener.accept() => {
-                    match res {
-                        Ok((mut stream, addr)) => {
-                            let _ = stream.set_nodelay(true);
-                            let peer_ip = addr.to_string();
-                            match self.claim_conn() {
-Ok(conn) => {
-                                     self.emit_if_current(&ConnectionStatusEvent {
-                                        status: ConnectionStatus::Connecting,
-                                        status_text: "正在连接对方……".into(),
-                                        error_code: None,
-                                        peer: None,
-                                        generation: conn.generation,
-                                    });
-                                    tracing::info!(gen = conn.generation, %addr, "收到入站连接");
-                                    let m = self.clone();
-                                    tokio::spawn(async move {
-                                        m.drive(conn, Some(stream), true, peer_ip, 0).await;
-                                    });
-                                }
-                                Err(_) => {
-                                    tracing::debug!(%addr, "已有活动连接，拒绝新的入站连接");
-                                    let _ = stream.shutdown().await;
+                            _ = cancel.cancelled() => break,
+                            res = listener.accept() => {
+                                match res {
+                                    Ok((mut stream, addr)) => {
+                                        let _ = stream.set_nodelay(true);
+                                        let peer_ip = addr.to_string();
+                                        match self.claim_conn() {
+            Ok(conn) => {
+                                                 self.emit_if_current(&ConnectionStatusEvent {
+                                                    status: ConnectionStatus::Connecting,
+                                                    status_text: "正在连接对方……".into(),
+                                                    error_code: None,
+                                                    peer: None,
+                                                    generation: conn.generation,
+                                                });
+                                                tracing::info!(gen = conn.generation, %addr, "收到入站连接");
+                                                let m = self.clone();
+                                                tokio::spawn(async move {
+                                                    m.drive(conn, Some(stream), true, peer_ip, 0).await;
+                                                });
+                                            }
+                                            Err(_) => {
+                                                tracing::debug!(%addr, "已有活动连接，拒绝新的入站连接");
+                                                let _ = stream.shutdown().await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(kind = %e.kind(), "accept 出错");
+                                        time::sleep(Duration::from_millis(100)).await;
+                                    }
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(kind = %e.kind(), "accept 出错");
-                            time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -394,7 +397,7 @@ Ok(conn) => {
     }
 
     /// 用户主动断开：尽量发送 disconnect，取消全部任务并回到 Offline。
-    /// 不自动重连；不清理配置中的 paired_peer / last_peer_ip（解除配对属阶段 7/10）。
+    /// 不自动重连；不清理配置中的 last_peer_ip。
     pub async fn disconnect(&self) {
         let conn = {
             let g = self.core.inner.lock().unwrap();
@@ -450,7 +453,7 @@ Ok(conn) => {
         .expect("本机身份已在配置阶段校验，hello 编码不应失败")
     }
 
-    /// 连接主流程：(出站则先 TCP 连接) → writer 任务 → hello 握手 → AwaitingPairing →
+    /// 连接主流程：(出站则先 TCP 连接) → writer 任务 → hello 握手 → Connected →
     /// 心跳任务 → 读循环 → 结束（finalize 保证旧连接不影响新连接状态）。
     async fn drive(
         &self,
@@ -547,11 +550,11 @@ Ok(conn) => {
             gen = conn.generation,
             peer = %peer.device_name,
             peer_ip = %peer_ip,
-            "hello 交换完成，进入等待配对"
+            "hello 交换完成，连接已建立"
         );
         self.emit_if_current(&ConnectionStatusEvent {
-            status: ConnectionStatus::AwaitingPairing,
-            status_text: "等待对方确认配对……".into(),
+            status: ConnectionStatus::Connected,
+            status_text: "已连接，剪贴板同步已开启。".into(),
             error_code: None,
             peer: Some(peer),
             generation: conn.generation,

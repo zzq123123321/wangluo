@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub const SECRET_LEN: usize = 32;
 /// 回退设备名：计算机名读取失败或为空时使用。
 pub const DEVICE_NAME_FALLBACK: &str = "Windows-PC";
-/// 设备名长度上限（字符）：设备名只用于界面显示与配对展示，超长截断。
+/// 设备名长度上限（字符）：设备名只用于界面显示与端到端 hello 交换，超长截断。
 pub const DEVICE_NAME_MAX_LEN: usize = 64;
 
 /// 本机身份：首次启动生成并持久化到配置；之后启动复用，不得重新生成。

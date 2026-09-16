@@ -13,14 +13,12 @@
 | 阶段 3 | ZeroTier IP 检测 | ✅ 完成（2026-09-16） |
 | 阶段 4 | 配置和设备身份 | ✅ 完成（2026-09-16） |
 | 阶段 5 | TCP 通信基础 | ✅ 完成（2026-09-16） |
-| 阶段 6 | 首次配对 | ⬜ 未开始 |
-| 阶段 7 | 后续认证 | ⬜ 未开始 |
-| 阶段 8 | 单机剪贴板监听 | ⬜ 未开始 |
-| 阶段 9 | 双向同步 | ⬜ 未开始 |
-| 阶段 10 | 自动重连和冲突处理 | ⬜ 未开始 |
-| 阶段 11 | 托盘和开机启动 | ⬜ 未开始 |
-| 阶段 12 | 安装包和防火墙 | ⬜ 未开始 |
-| 阶段 13 | 测试和发布 | ⬜ 未开始 |
+| 阶段 6 | 单机剪贴板监听 | ⬜ 未开始 |
+| 阶段 7 | 双向同步 | ⬜ 未开始 |
+| 阶段 8 | 自动重连和冲突处理 | ⬜ 未开始 |
+| 阶段 9 | 托盘和开机启动 | ⬜ 未开始 |
+| 阶段 10 | 安装包和防火墙 | ⬜ 未开始 |
+| 阶段 11 | 测试和发布 | ⬜ 未开始 |
 
 ## 环境事实（2026-09-16 核验）
 
@@ -37,7 +35,7 @@
 
 1. 骨架用 `create-tauri-app` vue-ts 模板生成（Tauri 2 + Vue 3.5 + Vite 8 + TS 6）。
 2. 前端状态不用 Pinia，用 `src/stores/app.ts` 的 reactive 模块（不新增依赖，符合文档"轻量"原则）；文档要求的 `stores/app.ts` 路径保留。
-3. `AppState`（src-tauri/src/state.rs）：`device_name` + `Mutex<Inner>`；`Inner` 含 zerotier_ip / status / status_text / peer / paused / last_sync / pairing_code。
+3. `AppState`（src-tauri/src/state.rs）：`device_name` + `Mutex<Inner>`；`Inner` 含 zerotier_ip / status / status_text / peer / paused / last_sync。**无配对设计**：填 IP 直连，握手成功即 Connected（见阶段 5 记录"设计变更"）。
 4. 统一错误类型 `AppError`（src-tauri/src/error.rs）：`#[serde(transparent)]` newtype(String)，前端收到字符串错误。
 5. 日志：tracing + tracing-subscriber env-filter，默认 `info,cliplink_lib=debug`。
 6. 前端命令入口：`get_app_snapshot`、`refresh_zerotier_ip`（阶段 3 真实检测）、`update_settings`、`get_device_identity_summary`（阶段 4）；其余命令按文档第 12 节在对应阶段添加。配置在 `%APPDATA%\com.localuser.cliplink\config.json`（Tauri 2 Windows 按 identifier 解析 app_data_dir）；secret 只在 Rust 侧，快照/事件只含非敏感字段。
@@ -60,11 +58,11 @@
 
 - **监听器规则**：只绑定"最近一次检测到的本机 ZeroTier IPv4 : 配置端口（45888）"，**不绑 0.0.0.0**。`NetworkManager::sync_listener(ip)` 幂等：`None` → 停止监听（IP 失效不再监听失效地址）；与上次相同 → 无操作（不重复启动）；IP 变化 → 取消旧监听任务、重绑新地址；绑定失败只 `tracing::warn`（记录地址+错误类型），不 panic、不影响已有连接。触发点复用阶段 3 的 `detect_and_notify`（结果变化时 spawn `sync_listener`），**无新增轮询器**。启动顺序：lib.rs setup 中先建 `NetworkManager` + `AppState`（含 net）+ `manage`，再注入 `zt_provider`（读 `AppState.inner.zerotier_ip` 的闭包，打破 manager↔AppState 循环依赖），最后 spawn ZT 轮询。
 - **帧格式**：4 字节**大端**长度前缀 + UTF-8 JSON；单条上限 **1 MiB**。读取顺序：先读 4 字节 → 长度 0 → `protocol_invalid_length`；> 1 MiB → `protocol_message_too_large`（**先查长度再分配缓冲**，不对超长帧分配大内存）→ 读正文 → 非 UTF-8 → `protocol_invalid_utf8` → JSON 解析失败 → `protocol_invalid_json` → EOF → `connection_closed`。任一协议错误关闭该连接（Error 状态），进程不崩溃。
-- **消息结构**（protocol.rs `Message`）：`{ version: 1, type, message_id(UUID), timestamp(毫秒), device_id, payload(Value), auth: Option<String> }`；`type` 经 `#[serde(rename="type")]`。类型：`hello`（payload: device_id/device_name/protocol_version）、`ping`（ping_id/sent_at）、`pong`（回显 ping_id/sent_at）、`disconnect`（reason）、`error`（reason）+ 未知类型安全忽略。**auth 恒为 null**（阶段 5 不认证、不伪造 HMAC；字段保留供阶段 7，序列化始终存在）。
-- **hello 流程**：出站 = 先发送本机 hello 再等对方 hello（5 秒超时 → `handshake_timeout`）；入站 = 先读对方 hello 再回复本机 hello。校验：`protocol_version==1`（不匹配 → 回最小 error 帧后关闭，`protocol_version_mismatch`）+ `validate_hello`（device_id 为 UUID、device_name 1..=64 字符、**不等于本机 device_id**）。握手成功 → 进入 **AwaitingPairing**（阶段 5 不进入 Connected）。同一连接中**重复 hello 明确忽略**（不计协议错误，避免对端重发导致误断开）。
+- **消息结构**（protocol.rs `Message`）：`{ version: 1, type, message_id(UUID), timestamp(毫秒), device_id, payload(Value), auth: Option<String> }`；`type` 经 `#[serde(rename="type")]`。类型：`hello`（payload: device_id/device_name/protocol_version）、`ping`（ping_id/sent_at）、`pong`（回显 ping_id/sent_at）、`disconnect`（reason）、`error`（reason）+ 未知类型安全忽略。**auth 恒为 null**（本版本不认证，字段保留以便将来扩展）。
+- **hello 流程**：出站 = 先发送本机 hello 再等对方 hello（5 秒超时 → `handshake_timeout`）；入站 = 先读对方 hello 再回复本机 hello。校验：`protocol_version==1`（不匹配 → 回最小 error 帧后关闭，`protocol_version_mismatch`）+ `validate_hello`（device_id 为 UUID、device_name 1..=64 字符、**不等于本机 device_id**）。握手成功 → 直接进入 **Connected**（无配对环节，见下方"取消配对"变更）。同一连接中**重复 hello 明确忽略**（不计协议错误，避免对端重发导致误断开）。
 - **心跳**：每 10 秒（`ManagerConfig::production`；测试 1 秒）发 ping（`time::interval` 首 tick 立即 → 握手后即刻发首个 ping）；收到匹配 pong 复位计数；连续 **3 次**无匹配 pong → `heartbeat_lost` → Error"连接已中断。"（error_code=`heartbeat_timeout`）。`HeartbeatState` 纯逻辑可单测。
 - **断开流程**：
-  - 用户主动（`disconnect_peer` 命令 / UI"断开"）：`user_requested` disconnect 帧（writer 排空保证发出）→ 取消心跳/读写任务 → Offline；文案按 ZT 状态："等待输入对方 IP。" / "未发现 ZeroTier IP。"；error_code=null；**不删除**配置里的 paired_peer / last_peer_ip（解除配对属阶段 7/10）。
+  - 用户主动（`disconnect_peer` 命令 / UI"断开"）：`user_requested` disconnect 帧（writer 排空保证发出）→ 取消心跳/读写任务 → Offline；文案按 ZT 状态："等待输入对方 IP。" / "未发现 ZeroTier IP。"；error_code=null；**不删除**配置里的 last_peer_ip。
   - 对方 disconnect 帧 → Offline"对方已断开连接。"。
   - 心跳失联 / 非预期 EOF → Error"连接已中断。"（`heartbeat_timeout` / `connection_closed`）。
   - TCP 连接失败/超时（5 秒）→ Error（`connect_failed` / `connect_timeout`）。
@@ -72,14 +70,14 @@
 - **单连接冲突策略**：全局**最多一条活动/建立中连接**（`inner.conn` 槽位）。入站时已有连接 → 新连接立即 shutdown 关闭；出站时已有连接 → 命令返回 `already_connected`（"已有活动连接，请先断开当前连接。"）。连接目标校验（`validate_peer_target`，commands 层）：trim 后合法 IPv4（复用 zerotier::is_valid_ipv4，拒绝 0.0.0.0/回环/链路本地/广播/组播/保留段）+ 拒绝本机当前 ZT IP（`self_connection`"不能连接本机自己的 ZeroTier IP"）。
 - **`connect_peer(ip)`**：校验 → **连接前保存** last_peer_ip（保存失败仅 `tracing::warn` 并继续连接，内存与磁盘均保持原值——与 update_settings 相同的"先落盘成功再更新内存"规则；注意 Mutex 不可重入：clone 后须先释放锁再落盘）→ `net.connect`。命令层错误为稳定中文文案（AppError 枚举序列化 `user_text()`，事件 error_code 为稳定 snake_code）。
 - **事件结构**：`connection-status-changed` → `{ status, status_text, error_code: string|null, peer: {device_name, ip}|null, generation }`（非敏感，无 secret/auth/原始消息）。前端 App.vue 监听后直接更新 store（status/statusText/peerDeviceName/peerIp）；Rust 侧已按代次过滤，前端无需再判旧事件。演示模式下忽略事件。
-- **前端接入**：store 新增 `connectPeer()`（invoke `connect_peer`，空输入前端拦截"请输入对方的 ZeroTier IP"，后端错误文案直接显示）/ `disconnectPeer()`；ConnectCard 连接按钮在 演示/connecting/awaiting_pairing/connected/reconnecting/paused 时禁用；PeerStatusCard 标题仅 connected/paused 显示"已连接："否则"对方设备："，详情行 awaiting 显示"等待配对确认"、error 显示 statusText，暂停按钮仅 connected/paused 可用，空态 connecting 显示"正在连接对方……"；PairingDialog 的"允许并记住/拒绝"阶段 5 禁用（阶段 6 实现），新增可用的"断开"按钮。
-- **测试**：`cargo test` 共 **69/69 通过**（单元 60 + 集成 9）。
+- **前端接入**：store 新增 `connectPeer()`（invoke `connect_peer`，空输入前端拦截"请输入对方的 ZeroTier IP"，后端错误文案直接显示）/ `disconnectPeer()`；ConnectCard 连接按钮在 演示/connecting/connected/reconnecting/paused 时禁用；PeerStatusCard 标题仅 connected/paused 显示"已连接："否则"对方设备："，error 显示 statusText，暂停按钮仅 connected/paused 可用，空态 connecting 显示"正在连接对方……"；断开按钮（阶段 5 起可用）。
+- **测试**：`cargo test` 共 **68/68 通过**（单元 59 + 集成 9）——取消配对后删除 1 个 `paired_peer_roundtrip` 单元测试。
   - 协议单元 16：全类型往返、大端前缀、分片读取（FragReader 模拟 TCP 分片）、超长长度不分配、0 长度、坏 UTF-8、坏 JSON、未知类型安全解码、>1MiB 拒绝编码、null auth 往返、hello 校验（版本/UUID/空名/超长名/本机 device_id）。
   - 心跳单元 3：pong 保持、不匹配/过期 pong 不重置、3 次失联。
   - 代次/槽位单元 2：claim 保护（AlreadyConnected）、旧代次 finalize 不影响新连接。
   - 目标校验单元 1：合法/非法/本机 IP/生产端口 45888。
   - 命令单元 4：输入校验（非法/回环/组播/本机 IP/提交后 AlreadyConnected/不可达地址有限时失败）、空闲断开为空操作、快照/身份摘要无 secret。
-  - **集成 9**（`tests/tcp_loopback.rs`，127.0.0.1 + 随机端口，裸 TcpStream 模拟对端；测试身份为固定测试数据）：入站 hello/ping/pong 全链路（进入 AwaitingPairing、收到对端 disconnect 退出）；出站连接 + hello + 用户主动断开（收到 disconnect 帧、回 Offline、槽位释放）；超长帧关闭；坏 JSON/坏 UTF-8 不崩溃；入站+出站无 hello 握手超时；对端关 socket 检测；已有连接时新入站被拒；出站连接被拒（connect_failed/timeout）；TEST-NET-1 不可达地址有限时失败。
+  - **集成 9**（`tests/tcp_loopback.rs`，127.0.0.1 + 随机端口，裸 TcpStream 模拟对端；测试身份为固定测试数据）：入站 hello/ping/pong 全链路（进入 Connected、收到对端 disconnect 退出）；出站连接 + hello + 用户主动断开（收到 disconnect 帧、回 Offline、槽位释放）；超长帧关闭；坏 JSON/坏 UTF-8 不崩溃；入站+出站无 hello 握手超时；对端关 socket 检测；已有连接时新入站被拒；出站连接被拒（connect_failed/timeout）；TEST-NET-1 不可达地址有限时失败。
   - `cargo fmt --check`、`cargo check` 无警告；`npm run build`（vue-tsc + vite）通过。
 - **实际运行验证（tauri dev 真实运行）**：
   - 监听：`192.168.191.180:45888`（本机 ZT IP，**非 0.0.0.0**，netstat 确认 OwningProcess=cliplink.exe）。
@@ -92,6 +90,14 @@
   - UI 视觉验收（新状态文案/按钮禁用态/断开弹窗）留独立视觉验收会话（本会话只做功能与协议验证）。
   - 正式配置 `last_peer_ip=10.147.17.99`（阶段 4 UI 测试值，未变）。
   - `docs/开发文档.md` 未改（协议/状态/文案与文档第 8/11/12/15 节一致；阶段 5 无需求变更）。
+
+### 设计变更（2026-09-16，用户决策）：取消配对
+
+- **决策**：填对方 ZeroTier IP 直接连接，握手（hello 交换）成功后即进入 **Connected**，不再有配对/认证/共享密钥环节。理由：用户明确"填 IP 就能连就够了"；安全模型见 docs 第 9 节（信任 ZeroTier 网络边界，本版本不做消息认证）。
+- **代码影响**：删除 `AwaitingPairing` 状态与 `pairing_code`（state.rs）、`PairedPeer` 结构与 `SHARED_KEY_LEN`（config.rs，含 3 处测试）、`paired_peer` 配置字段及其校验、hello 中认证逻辑切点、前端 `PairingDialog.vue`（文件删除）/awaiting_pairing 状态/`pairingCode` 字段/相关 demo 数据、"连接并配对"按钮文案（改"连接"）。协议 `auth` 字段保留但恒为 null。
+- **兼容**：已存 `config.json` 若含 `paired_peer` 字段会被 serde 忽略（未知字段策略），无需迁移。
+- **阶段表调整**：原阶段 6（首次配对）/7（后续认证）取消；阶段 6=单机剪贴板监听、7=双向同步，余下顺延（见上表）。
+- **测试**：`cargo test` 68/68 通过（比取消配对前少 1 个配对往返测试）、`npm run build` 通过；`cargo fmt --check`/`cargo check` 干净。
 
 ## 阶段 4 完成记录（2026-09-16）
 
@@ -165,10 +171,9 @@
 
 ## 已知问题 / 待办
 
-- 开机启动复选框已持久化偏好值（阶段 4）；系统开机启动插件与"打开设置"按钮留阶段 11。
-- `PairingDialog` 的确认码字段 `pairing_code` 尚未加入 `AppSnapshot`（阶段 6 添加）。
-- 图标仍为模板 tauri.svg（阶段 12 换正式图标并生成安装包图标）。
-- 尚未 git 初始化与提交（用户要求阶段完成后统一决定）。
+- 开机启动复选框已持久化偏好值（阶段 4）；系统开机启动插件与"打开设置"按钮留阶段 9。
+- 图标仍为模板 tauri.svg（阶段 10 换正式图标并生成安装包图标）。
+- 两机真实互连（本机 + 4090）待 4090 装 ClipLink 后验证（见阶段 5 遗留）。
 - "未发现 ZeroTier IP"的真实运行场景未实测（本机 LLM API 依赖 ZT，见决策 14）；由单测覆盖，后续可在 4090 主机（不依赖 ZT 跑 LLM）上补测。
 
 ## 下一步（阶段 6：首次配对）

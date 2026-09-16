@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 
-/// 前端快照：只含非敏感字段。device_secret 与 paired_peer.shared_key 等认证材料
+/// 前端快照：只含非敏感字段。device_secret 等认证材料
 /// 不在此结构中，因此不会进入前端、事件或序列化结果。
 #[derive(Debug, Serialize)]
 pub struct AppSnapshot {
@@ -22,7 +22,7 @@ pub struct AppSnapshot {
     pub hint_warn: bool,
     pub status: ConnectionStatus,
     pub status_text: String,
-    /// 对方摘要（设备名 + IP）；paired_peer 存在时即为配对对方的非敏感摘要，不含 shared_key
+    /// 对方摘要（设备名 + IP）；连接成功后的运行期对方信息，非敏感
     pub peer: Option<crate::state::PeerInfo>,
     pub paused: bool,
     pub last_sync: Option<String>,
@@ -230,7 +230,7 @@ pub async fn connect_peer(state: State<'_, Arc<AppState>>, ip: String) -> Result
 }
 
 /// 用户主动断开：发送 disconnect、停止心跳/读写任务、回到 Offline。
-/// 不删除配置中的 paired_peer / last_peer_ip（解除配对属后续阶段）。
+/// 不删除配置中的 last_peer_ip（连接目标由用户下次输入决定）。
 async fn do_disconnect(state: &AppState) -> Result<(), AppError> {
     state.net.disconnect().await;
     Ok(())
@@ -244,7 +244,7 @@ pub async fn disconnect_peer(state: State<'_, Arc<AppState>>) -> Result<(), AppE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConfigStore, PairedPeer};
+    use crate::config::ConfigStore;
     use std::sync::Arc;
 
     struct TestSink;
@@ -272,22 +272,15 @@ mod tests {
         AppState::new(store, cfg, net)
     }
 
-    // 敏感字段（device_secret / shared_key）不出现在前端快照序列化结果中；
+    // 敏感字段（device_secret）不出现在前端快照序列化结果中；
     // 非敏感身份与设置正常出现。仅用测试专用值，不输出真实值。
     #[test]
     fn snapshot_contains_no_secrets() {
         let state = test_state();
         let test_device_secret = "ab".repeat(32);
-        let test_shared_key = "cd".repeat(32);
         let cfg = {
             let mut g = state.config.lock().unwrap();
             g.identity.device_secret = test_device_secret.clone();
-            g.paired_peer = Some(PairedPeer {
-                device_id: uuid::Uuid::new_v4().to_string(),
-                device_name: "SNAP-TEST".into(),
-                ip: "10.147.17.36".into(),
-                shared_key: test_shared_key.clone(),
-            });
             g.clone()
         };
         let inner = Inner {
@@ -300,7 +293,6 @@ mod tests {
         let snap = snapshot_from(&cfg, &inner);
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains(&test_device_secret));
-        assert!(!json.contains(&test_shared_key));
         assert!(json.contains("SNAP-TEST"));
         assert!(json.contains(&cfg.identity.device_id));
         assert!(json.contains("10.147.17.36"));

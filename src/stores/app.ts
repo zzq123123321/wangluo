@@ -20,7 +20,6 @@ export const store = reactive<{
   peerIp: string | null;
   paused: boolean;
   lastSync: string | null;
-  pairingCode: string | null;
   peerInput: string;
   error: string | null;
   demoState: string | null;
@@ -42,7 +41,6 @@ export const store = reactive<{
   peerIp: null,
   paused: false,
   lastSync: null,
-  pairingCode: null,
   peerInput: "",
   error: null,
   demoState: null,
