@@ -1,0 +1,113 @@
+﻿<script setup lang="ts">
+import { onMounted, ref, type Component } from "vue";
+import { listen } from "@tauri-apps/api/event";
+import StatusBanner from "./components/StatusBanner.vue";
+import LocalAddressCard from "./components/LocalAddressCard.vue";
+import ConnectCard from "./components/ConnectCard.vue";
+import PeerStatusCard from "./components/PeerStatusCard.vue";
+import PairingDialog from "./components/PairingDialog.vue";
+import { store, refreshSnapshot, updateSettings } from "./stores/app";
+import { STATUS_TEXT, type ConnectionStatusEvent, type ZtIpChangedEvent } from "./types/app";
+import type { DemoKey } from "./stores/demo";
+
+const dev = import.meta.env.DEV;
+
+const DevSwitcher = ref<Component | null>(null);
+
+async function onAutostartChange(e: Event) {
+  if (!store.loaded) return;
+  const checked = (e.target as HTMLInputElement).checked;
+  try {
+    await updateSettings({ autostart: checked });
+  } catch (err) {
+    store.error = String(err);
+  }
+}
+
+onMounted(async () => {
+  if (dev) {
+    const params = new URL(location.href).searchParams;
+    if (params.get("dark") === "1") document.documentElement.classList.add("dark");
+    else if (params.get("light") === "1") document.documentElement.classList.add("light");
+    const { DEMO_STATES, applyDemo } = await import("./stores/demo");
+    const key = params.get("demo");
+    if (key && key in DEMO_STATES) applyDemo(key as DemoKey);
+    DevSwitcher.value = (await import("./components/DevStateSwitcher.vue")).default;
+  }
+  // 后端 ZeroTier IP 变化事件：拉取最新快照刷新界面（演示模式下 refreshSnapshot 自动跳过）
+  try {
+    await listen<ZtIpChangedEvent>("zerotier-ip-changed", () => {
+      void refreshSnapshot();
+    });
+    // 阶段 5：连接状态事件（Rust 侧已按连接代次过滤，前端直接应用）
+    await listen<ConnectionStatusEvent>("connection-status-changed", (ev) => {
+      if (store.demoState) return;
+      const d = ev.payload;
+      store.status = d.status;
+      store.statusText = d.status_text || STATUS_TEXT[d.status];
+      store.peerDeviceName = d.peer?.device_name ?? null;
+      store.peerIp = d.peer?.ip ?? null;
+    });
+  } catch {
+    // 普通浏览器无 Tauri 运行时：无事件通道，开发页靠 demo 状态预览
+  }
+  refreshSnapshot();
+});
+</script>
+
+<template>
+  <main class="layout">
+    <StatusBanner />
+    <LocalAddressCard />
+    <ConnectCard />
+    <PeerStatusCard />
+    <div class="foot">
+      <div class="last-sync">
+        最近同步：{{ store.lastSync ?? "暂无" }}
+      </div>
+      <div class="foot-row">
+        <label class="check">
+          <input
+            type="checkbox"
+            :checked="store.autostart"
+            :disabled="!!store.demoState || !store.loaded"
+            title="保存开机启动偏好；系统开机启动功能阶段 11 接入"
+            @change="onAutostartChange"
+          />
+          <span>开机启动</span>
+        </label>
+        <component :is="DevSwitcher" v-if="dev && DevSwitcher" />
+        <button class="link" disabled title="阶段 11 实现">打开设置</button>
+      </div>
+    </div>
+    <PairingDialog />
+  </main>
+</template>
+
+<style scoped>
+.foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.last-sync {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.foot-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.link {
+  background: none;
+  box-shadow: none;
+  border: none;
+  color: var(--muted);
+  padding: 0.2em 0.6em;
+}
+</style>

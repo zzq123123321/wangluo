@@ -1,0 +1,103 @@
+<script setup lang="ts">
+import { computed } from "vue";
+import { store, disconnectPeer } from "../stores/app";
+
+const borderTone = computed(() => {
+  if (!store.peerDeviceName) return "";
+  if (store.status === "connected") return "ok";
+  if (store.status === "paused") return "idle";
+  if (store.status === "error") return "bad";
+  return "busy";
+});
+
+/** 仅 connected/paused 才称“已连接”；建立中/等待配对/出错显示“对方设备” */
+const headerLabel = computed(
+  () => (store.status === "connected" || store.status === "paused" ? "已连接：" : "对方设备：")
+);
+
+const detailText = computed(() => {
+  if (store.status === "awaiting_pairing") return "等待配对确认";
+  if (store.paused) return "已暂停同步";
+  if (store.status === "connected") return "剪贴板同步已开启";
+  if (store.status === "error") return store.statusText;
+  return "";
+});
+
+const pauseDisabled = computed(
+  () => store.status !== "connected" && store.status !== "paused"
+);
+
+function pause() {
+  // 阶段 9 实现 set_sync_paused
+}
+function onDisconnect() {
+  void (async () => {
+    const err = await disconnectPeer();
+    if (err) store.error = err;
+  })();
+}
+</script>
+
+<template>
+  <section class="card peer" :class="borderTone">
+    <template v-if="store.peerDeviceName">
+      <div class="row top">
+        <span class="dot" :class="store.status"></span>
+        <span class="name">{{ headerLabel }}{{ store.peerDeviceName }}</span>
+      </div>
+      <div class="detail">
+        {{ store.peerIp }}<template v-if="detailText"> · {{ detailText }}</template>
+      </div>
+      <div class="row buttons">
+        <button :disabled="pauseDisabled" @click="pause">{{ store.paused ? "恢复" : "暂停" }}</button>
+        <button @click="onDisconnect">断开</button>
+      </div>
+    </template>
+    <div v-else class="empty">
+      {{ store.status === "connecting" ? "正在连接对方……" : "等待输入对方 IP" }}
+    </div>
+  </section>
+</template>
+
+<style scoped>
+.peer {
+  border-color: var(--gray);
+}
+.peer.ok {
+  border-color: var(--green);
+}
+.peer.busy {
+  border-color: var(--yellow);
+}
+.peer.bad {
+  border-color: var(--red);
+}
+.top {
+  justify-content: flex-start;
+  gap: 6px;
+}
+.name {
+  font-weight: 600;
+}
+.detail {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 4px 0 8px;
+}
+.empty {
+  font-size: 13px;
+  color: var(--muted);
+  padding: 4px 0;
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--gray);
+}
+.dot.connected { background: var(--green); }
+.dot.reconnecting,
+.dot.connecting,
+.dot.awaiting_pairing { background: var(--yellow); }
+.dot.error { background: var(--red); }
+</style>

@@ -1,0 +1,185 @@
+:root {
+  --green: #2e9e44;
+  --yellow: #c99700;
+  --red: #d64545;
+  --gray: #9a9a9a;
+  --muted: #7a7a7a;
+  --border: #d8d8d8;
+  --panel: #ffffff;
+  --hover: rgba(127, 127, 127, 0.14);
+
+  font-family: "Segoe UI", "Microsoft YaHei", Inter, Avenir, Helvetica, Arial,
+    sans-serif;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 400;
+
+  color: #1f1f1f;
+  background-color: #f5f5f5;
+
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --green: #43b45c;
+    --yellow: #e0b400;
+    --red: #e05c5c;
+    --gray: #8a8a8a;
+    --border: #3a3a3a;
+    --panel: #2b2b2b;
+    --muted: #9a9a9a;
+    --hover: rgba(255, 255, 255, 0.1);
+    color: #f0f0f0;
+    background-color: #232323;
+  }
+}
+
+/* 开发预览：?dark=1 强制深色（生产仍跟随系统） */
+:root.dark {
+  --green: #43b45c;
+  --yellow: #e0b400;
+  --red: #e05c5c;
+  --gray: #8a8a8a;
+  --border: #3a3a3a;
+  --panel: #2b2b2b;
+  --muted: #9a9a9a;
+  --hover: rgba(255, 255, 255, 0.1);
+  color: #f0f0f0;
+  background-color: #232323;
+}
+
+/* 开发预览：?light=1 在深色系统上强制浅色 */
+:root.light {
+  --green: #2e9e44;
+  --yellow: #c99700;
+  --red: #d64545;
+  --gray: #9a9a9a;
+  --border: #d8d8d8;
+  --panel: #ffffff;
+  --muted: #7a7a7a;
+  --hover: rgba(127, 127, 127, 0.14);
+  color: #1f1f1f;
+  background-color: #f5f5f5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+#app {
+  height: 100vh;
+}
+
+.layout {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  padding: 16px;
+  overflow: hidden;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  flex-shrink: 0;
+}
+
+.card .label {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.card .hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+  word-break: break-word;
+}
+
+.card .row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.card .row input {
+  flex: 1;
+  min-width: 0;
+}
+
+input,
+button {
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  padding: 0.45em 0.9em;
+  font-size: 13px;
+  font-family: inherit;
+  color: inherit;
+  background-color: var(--panel);
+  box-shadow: none;
+  outline: none;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+input {
+  background-color: transparent;
+  min-width: 0;
+}
+
+input:read-only {
+  color: var(--muted);
+}
+
+button {
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--green);
+}
+
+button:active:not(:disabled) {
+  background-color: var(--hover);
+}
+
+button:disabled,
+button[disabled] {
+  opacity: 0.5;
+  background-color: var(--hover);
+  color: var(--muted);
+  border-color: var(--border);
+  cursor: not-allowed;
+}
+
+/* 键盘焦点：仅键盘导航时显示，避免鼠标点击的残影 */
+:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 1px;
+  border-radius: 8px;
+}
+
+input:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 0;
+}
+
+/* 长文本统一省略号，避免撑破固定窗口 */
+.ellipsis {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
