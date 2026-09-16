@@ -66,8 +66,9 @@
 - **测试**：新增 3 个单元测试（62 单元 + 9 集成 = **71/71**）：哈希与 `sha2` 一致且 64 位 hex、不同输入不同哈希、大小边界（恰好 1 MiB 不触发 / 超 1 MiB 触发）。`cargo fmt --check`/`cargo check` 干净（无 dead-code 警告：`shutdown` 通道已按 ponytail 原则删除），`npm run build` 通过。
 - **遗留**：
   - 真实 UI 无错误展示位（`app-error` 事件存到 `store.error` 但界面未渲染，阶段 7 决定是否加错误提示）。
-  - 剪贴板真实读写验证（复制文字观察 debug 日志）未做——集成测试无法触达真实系统剪贴板；tauri dev 真机验证（复制文字、复制图片忽略、超限提示）留待 4090 装上 ClipLink 后的双机环节或本机 tauri dev 手动验证。
+  - 剪贴板真实读写验证（已完成一次，代码不留存）：独立 `clipboard_real.rs` 测试直接对系统剪贴板 `set_text` 后延时 400ms `get_text` 读回一致（模拟记事本/浏览器复制），跑完删除（长留会覆盖用户剪贴板/污染并行测试）；开发机 tauri dev 运行期间 `Set-Clipboard` 出现剪贴板竞争偶发报错（文字实际写入成功，`Get-Clipboard` 可读回）——反证 worker 确实在按 300ms 轮询系统剪贴板。4090 装 ClipLink 后的双机环节再顺带复核发送侧。
   - `last_clipboard_hash/text` 目前只在内存，应用重启后重置（阶段 7 不需要跨重启保留哈希）。
+  - **git push 待重试**：阶段 6 提交 `2271036` 已完成提交，但 push 时手机热点连 GitHub 失败（443 慢/不可达），本地已提交未推送，网络恢复后 `git push origin main`。
 
 ## 阶段 5 完成记录（2026-09-16）
 
