@@ -13,7 +13,7 @@
 | 阶段 3 | ZeroTier IP 检测 | ✅ 完成（2026-09-16） |
 | 阶段 4 | 配置和设备身份 | ✅ 完成（2026-09-16） |
 | 阶段 5 | TCP 通信基础 | ✅ 完成（2026-09-16） |
-| 阶段 6 | 单机剪贴板监听 | ⬜ 未开始 |
+| 阶段 6 | 单机剪贴板监听 | ✅ 完成（2026-09-16） |
 | 阶段 7 | 双向同步 | ⬜ 未开始 |
 | 阶段 8 | 自动重连和冲突处理 | ⬜ 未开始 |
 | 阶段 9 | 托盘和开机启动 | ⬜ 未开始 |
@@ -53,6 +53,21 @@
 18. `NetworkManager`（network.rs）：`Arc<NetCore>` 克隆开销为引用计数；状态事件经 `StatusSink` 单一出口（生产 `TauriStatusSink`：写 `AppState.inner` + emit `connection-status-changed`；测试用收集型 sink）。**事件按连接代次（generation）过滤**：非终结事件仅在槽位仍属于该 generation 时发出；终结事件（finalize）先比对槽位、匹配才清理并发出，旧连接任务不会覆盖新连接状态（settled AtomicBool 保证每连接只终结一次）。
 19. 心跳：`time::interval` 首个 tick 立即完成 → 握手完成后**立即发首个 ping**（属预期行为，对端回 pong 即可）；连续 3 次无匹配 pong 判 `heartbeat_timeout`；不匹配/过期 pong 不重置计数。
 20. writer 任务是唯一写 socket 的任务（mpsc 通道串行化所有帧）；收到取消信号时**先排空已入队帧**（如用户 disconnect 消息）再关闭，保证用户主动断开的 disconnect 帧一定发出。
+
+## 阶段 6 完成记录（2026-09-16）
+
+- **剪贴板工作线程**：`clipboard.rs` 提供 `start(state: Arc<AppState>, app: AppHandle)`，挂到 tauri 全局 async runtime（随进程退出销毁，无需手动停止）。每 **300ms** `tokio::time::interval` 触发一轮。**剪贴板访问单线程**（arboard 实例每轮 `Clipboard::new()` 新建 + `get_text()` 读取，无需跨轮持有实例，避免剪贴板句柄长期占用）。
+- **读取纯文字**：`arboard`（v3.6.1，Windows 后端 clipboard-win），仅 `get_text()` 文字接口——图片/文件等非文字内容返回 Err 自然被忽略。读取失败 `tracing::trace` 后跳过本轮（下轮自动重试）。
+- **SHA-256 变化检测**：`sha2` 0.10 对文字字节计算摘要 → `identity::hex_encode` 转 64 位 hex。与 `AppState.inner.last_clipboard_hash` 比较：相同跳过（不重复触发）；不同则更新 hash 和 `last_clipboard_text`（供阶段 7 发送），`tracing::debug` 记录变化。
+- **大小限制**：文字 `len() > 1 MiB`（`MAX_CLIPBOARD_BYTES=1024*1024`，与协议 MAX_MESSAGE_BYTES 一致）→ `tracing::warn` + emit `app-error` 事件（文案"剪贴板文字超过 1 MiB，本次未同步。"，与文档第 13 节一致）→ 跳过（不写入内部状态，不留作待发内容）。**恰好 1 MiB 不触发**。
+- **暂停**：每轮先读 `inner.paused`（与配置 sync_paused/update_settings 同一字段），暂停时直接跳过（不读剪贴板），恢复后自然继续。
+- **空字符串跳过**：`text.is_empty()` 不处理（文档"空字符串不发送"）。
+- **前端接入**：`types/app.ts` 新增 `AppErrorEvent { message }`；`App.vue` 监听 `app-error` 事件（演示模式下忽略）→ `store.error`。暂无 UI 展示位置（阶段 7/9 决定如何展示）。
+- **测试**：新增 3 个单元测试（62 单元 + 9 集成 = **71/71**）：哈希与 `sha2` 一致且 64 位 hex、不同输入不同哈希、大小边界（恰好 1 MiB 不触发 / 超 1 MiB 触发）。`cargo fmt --check`/`cargo check` 干净（无 dead-code 警告：`shutdown` 通道已按 ponytail 原则删除），`npm run build` 通过。
+- **遗留**：
+  - 真实 UI 无错误展示位（`app-error` 事件存到 `store.error` 但界面未渲染，阶段 7 决定是否加错误提示）。
+  - 剪贴板真实读写验证（复制文字观察 debug 日志）未做——集成测试无法触达真实系统剪贴板；tauri dev 真机验证（复制文字、复制图片忽略、超限提示）留待 4090 装上 ClipLink 后的双机环节或本机 tauri dev 手动验证。
+  - `last_clipboard_hash/text` 目前只在内存，应用重启后重置（阶段 7 不需要跨重启保留哈希）。
 
 ## 阶段 5 完成记录（2026-09-16）
 

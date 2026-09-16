@@ -34,6 +34,10 @@ pub struct Inner {
     pub last_sync: Option<String>,
     /// 已保存的对方 IP（来自配置，供前端输入框回显）
     pub last_peer_ip: Option<String>,
+    /// 阶段 6：本机剪贴板内容哈希（SHA-256 hex），用于变化检测
+    pub last_clipboard_hash: Option<String>,
+    /// 阶段 6：本机剪贴板最新文字（供阶段 7 发送）
+    pub last_clipboard_text: Option<String>,
 }
 
 /// 完整配置（含 device_secret 等敏感字段）只在 Rust 侧持有；

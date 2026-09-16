@@ -58,7 +58,11 @@ pub fn run() {
             net.set_zt_provider(Arc::new(move || {
                 state_ref.inner.lock().ok()?.zerotier_ip.clone()
             }));
+            let state_for_clipboard = state.clone();
             app.manage(state);
+
+            // 阶段 6：剪贴板监听（每 300ms 读一次纯文字，检测变化）
+            clipboard::start(state_for_clipboard, app.handle().clone());
 
             // 阶段 3：启动后立即检测一次，之后每 10 秒复查。
             // 检测结果变化时由 detect_and_notify 内部触发 listener 启停/重绑定（阶段 5 复用同一路径，无新增轮询器）。

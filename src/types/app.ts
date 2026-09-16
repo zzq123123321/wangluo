@@ -69,3 +69,8 @@ export const STATUS_COLOR: Record<ConnectionStatus, "green" | "yellow" | "red" |
   offline: "gray",
   paused: "gray",
 };
+
+/** app-error 事件 payload（后端通用错误提示） */
+export interface AppErrorEvent {
+  message: string;
+}

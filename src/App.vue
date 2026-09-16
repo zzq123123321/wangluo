@@ -6,7 +6,7 @@ import LocalAddressCard from "./components/LocalAddressCard.vue";
 import ConnectCard from "./components/ConnectCard.vue";
 import PeerStatusCard from "./components/PeerStatusCard.vue";
 import { store, refreshSnapshot, updateSettings } from "./stores/app";
-import { STATUS_TEXT, type ConnectionStatusEvent, type ZtIpChangedEvent } from "./types/app";
+import { STATUS_TEXT, type ConnectionStatusEvent, type ZtIpChangedEvent, type AppErrorEvent } from "./types/app";
 import type { DemoKey } from "./stores/demo";
 
 const dev = import.meta.env.DEV;
@@ -46,6 +46,11 @@ onMounted(async () => {
       store.statusText = d.status_text || STATUS_TEXT[d.status];
       store.peerDeviceName = d.peer?.device_name ?? null;
       store.peerIp = d.peer?.ip ?? null;
+    });
+    // 阶段 6：通用错误提示事件（如剪贴板文字超限）
+    await listen<AppErrorEvent>("app-error", (ev) => {
+      if (store.demoState) return;
+      store.error = ev.payload.message;
     });
   } catch {
     // 普通浏览器无 Tauri 运行时：无事件通道，开发页靠 demo 状态预览

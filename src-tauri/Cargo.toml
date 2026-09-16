@@ -30,6 +30,8 @@ tokio = { version = "1", features = ["time", "net", "io-util", "sync", "macros"]
 tokio-util = "0.7"
 getrandom = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
+arboard = "3"
+sha2 = "0.10"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
