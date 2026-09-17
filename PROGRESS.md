@@ -25,6 +25,12 @@
 - T11-01 PASS：仓库基线审查（基线 `4563fc2` 与 origin/main 一致，工作树干净；确认便携化事实与残留项）。
 - T11-02 PASS：tauri.conf.json 便携配置收尾（bundle.active=false、删除 NSIS target、修正 shortDescription/longDescription）。
 - 提交：`6064496`（已推送 origin/main）。
+- T11-04 PASS：网络连接生命周期静态审查 + 修复。
+  - **发现并修复：自动重连 attempts 被自动 connect 提前清零**——`reconnect_attempt()` 原调用公开 `connect()`，而 `connect()` 首行执行 `cancel_reconnect()`（把退避计数归零），导致每轮自动重连永远按 2 秒第一档退避，到不了设计要求的 5/10/20/30 秒。已拆出 `connect_inner(peer, port, reset_reconnect)`：公开 `connect()`（用户意图）重置退避；自动重连用 `reset_reconnect=false` 保留计数；真正握手成功后仍由 drive 重置 `attempts=0`。
+  - **发现并修复：shutdown 缺退出门槛**——旧连接任务在 shutdown 清槽前 finalize 会把重连重新调度起来（"退出后继续重连"）。新增 `NetCore.exiting` 门槛，`shutdown()` 置位，`start_reconnect()`/`reconnect_attempt()` 置位后一律拒绝。
+  - **顺带加固：`reconnect_attempt` 连接请求失败但期间已有连接接管时**，不再无条件 emit Reconnecting / 续排重连，避免覆盖新连接状态。
+  - 新增 6 个单元测试（自动路径不清零、用户 connect 重置、逐轮递增+shutdown 归零、握手成功重置、disconnect 重置、shutdown 封禁重连），3 个原生命周期测试全部保留。
+  - 提交：`fix: harden network connection lifecycle`（已推送 origin/main）。
 
 ## 环境事实（2026-09-16 核验）
 
@@ -273,5 +279,5 @@
 
 ## 下一步（阶段 11：测试和发布）
 
-1. T11-03 文档一致性收尾（本轮）：对齐 `docs/开发文档.md` 与 PROGRESS.md 到便携化实现。
-2. 下一轮等待总指挥下发 T11-04。
+1. T11-04 网络连接生命周期审查与修复已完成（见上方 T11 进展）。
+2. 下一轮等待总指挥下发 T11-05。

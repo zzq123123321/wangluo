@@ -196,6 +196,9 @@ struct NetCore {
     cfg: ManagerConfig,
     /// 阶段 8：自动重连开关（可变，运行时从 AppConfig 同步）
     reconnect_enabled: AtomicBool,
+    /// T11-04：退出门槛——shutdown 置位后绝不再安排/执行自动重连，
+    /// 防止旧连接任务稍后 finalize 又把重连拉回来（"退出后继续重连"）。
+    exiting: AtomicBool,
     sink: Arc<dyn StatusSink>,
     zt_provider: Mutex<Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>>,
     /// 阶段 8：当前"已保存的对方 IP"读取器（自动重连目标；lib.rs 注入，从 AppState 读取）
@@ -278,6 +281,7 @@ impl NetworkManager {
                 device_id,
                 device_name,
                 reconnect_enabled: AtomicBool::new(cfg.reconnect),
+                exiting: AtomicBool::new(false),
                 cfg,
                 sink,
                 zt_provider: Mutex::new(None),
@@ -508,9 +512,24 @@ impl NetworkManager {
     }
 
     /// 主动连接：校验由 commands 层完成；这里只做槽位保护 + 5 秒超时 TCP 连接 + 握手。
-    /// 用户主动连接会取消未完成的重连任务（与重连共用单一槽位）。
+    /// 用户主动连接会取消未完成的重连任务并重置退避计数（与重连共用单一槽位）。
     pub async fn connect(&self, peer_ip: &str, port: u16) -> Result<(), AppError> {
-        self.cancel_reconnect();
+        self.connect_inner(peer_ip, port, true).await
+    }
+
+    /// 共享连接启动流程。
+    /// `reset_reconnect=true`（用户主动连接）：先取消旧重连任务、重置退避计数。
+    /// `reset_reconnect=false`（自动重连内部调用，T11-04）：不得重置退避计数——
+    /// 否则每轮自动尝试都把退避打回 2 秒第一档，永远到不了 5/10/20/30 秒。
+    async fn connect_inner(
+        &self,
+        peer_ip: &str,
+        port: u16,
+        reset_reconnect: bool,
+    ) -> Result<(), AppError> {
+        if reset_reconnect {
+            self.cancel_reconnect();
+        }
         let conn = self.claim_conn()?;
         let gen = conn.generation;
         self.emit_if_current(&ConnectionStatusEvent {
@@ -569,6 +588,9 @@ impl NetworkManager {
     /// 每轮尝试失败（连接任务 finalize 触发）会再次进入本方法，退避间隔逐级递增；
     /// 成功后 drive() 中重置计数（attempts=0），下次断线从头退避。
     fn start_reconnect(&self) -> bool {
+        if self.core.exiting.load(Ordering::Relaxed) {
+            return false;
+        }
         if !self.core.reconnect_enabled.load(Ordering::Relaxed) {
             return false;
         }
@@ -600,13 +622,23 @@ impl NetworkManager {
     }
 
     async fn reconnect_attempt(&self, peer: String, port: u16) {
+        // 退出后残留的延迟任务醒来也不得再发起连接（T11-04）
+        if self.core.exiting.load(Ordering::Relaxed) {
+            return;
+        }
         // 已有活动连接（用户已连接 / 对端已连入）时跳过本轮，不再安排下一轮
         if self.is_busy() {
             tracing::debug!(peer = %peer, "自动重连：已有活动连接，停止本轮");
             return;
         }
         tracing::info!(peer = %peer, "自动重连：开始尝试建立连接");
-        if let Err(e) = self.connect(&peer, port).await {
+        // reset_reconnect=false：自动重连不得清零退避计数（T11-04）。
+        if let Err(e) = self.connect_inner(&peer, port, false).await {
+            // 期间已有连接接管（如对方入站接入）→ 停止自动重连，不得覆盖其状态
+            if self.is_busy() {
+                tracing::debug!(peer = %peer, "自动重连：连接请求期间已有连接接管，停止");
+                return;
+            }
             tracing::warn!(peer = %peer, %e, "自动重连启动失败（槽位/编码）");
             // 未进入连接任务（无 finalize 触发下一轮），保持“重试中”并手动安排下一轮
             self.emit(&ConnectionStatusEvent {
@@ -623,7 +655,9 @@ impl NetworkManager {
     }
 
     /// 停止 listener 与活动连接（测试收尾/应用退出）。
+    /// 先置退出门槛再取消任务，保证旧连接任务稍后 finalize 不会重新安排重连（T11-04）。
     pub async fn shutdown(&self) {
+        self.core.exiting.store(true, Ordering::Relaxed);
         self.cancel_reconnect();
         {
             let g = self.core.inner.lock().unwrap();
@@ -1156,6 +1190,9 @@ pub fn validate_peer_target(ip: &str, local_zt_ip: Option<&str>) -> Result<Ipv4A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    const TEST_PEER_DEVICE_ID: &str = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
 
     struct VecSink(Mutex<Vec<ConnectionStatusEvent>>);
 
@@ -1372,5 +1409,175 @@ mod tests {
         // 用户主动断开会取消未完成的重连任务并重置计数
         m.cancel_reconnect();
         assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0);
+    }
+
+    /// 测试辅助：带超时读取一帧消息。
+    async fn read_any(rd: &mut (impl tokio::io::AsyncRead + Unpin)) -> protocol::Message {
+        tokio::time::timeout(Duration::from_secs(2), protocol::read_message(rd))
+            .await
+            .expect("2 秒内未收到帧")
+            .expect("读取帧失败")
+    }
+
+    // T11-04：自动重连路径（reset_reconnect=false）不得清零退避计数——
+    // 若清零，连续失败会永远停留在 2 秒第一档，到不了 5/10/20/30 秒。
+    #[tokio::test]
+    async fn reconnect_connect_keeps_attempt_backoff() {
+        let (m, _sink) = test_manager();
+        {
+            let mut rs = m.core.reconnect.lock().unwrap();
+            rs.attempts = 4; // 已连续失败 4 次，应处于 20s/30s 档位
+        }
+        let r = m.connect_inner("192.0.2.1", 45888, false).await;
+        assert!(r.is_ok(), "槽位空闲时自动重连应能发起连接");
+        assert_eq!(
+            m.core.reconnect.lock().unwrap().attempts,
+            4,
+            "自动重连内部连接不得清零退避计数"
+        );
+        // 该连接随后在 connect_timeout(300ms) 内失败并 finalize
+        //（test_manager reconnect=false，finalize 不会续排重连）
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(!m.is_busy(), "失败连接应释放槽位");
+        assert_eq!(
+            m.core.reconnect.lock().unwrap().attempts,
+            4,
+            "失败 finalize 也不得重置退避计数"
+        );
+        m.shutdown().await;
+    }
+
+    // T11-04：用户主动 connect 重置退避计数
+    #[tokio::test]
+    async fn user_connect_resets_reconnect_attempts() {
+        let (m, _sink) = test_manager();
+        {
+            let mut rs = m.core.reconnect.lock().unwrap();
+            rs.attempts = 4;
+        }
+        let r = m.connect("192.0.2.1", 45888).await; // 公开 connect = 用户主动意图
+        assert!(r.is_ok());
+        assert_eq!(
+            m.core.reconnect.lock().unwrap().attempts,
+            0,
+            "用户主动 connect 应重置退避计数"
+        );
+        m.shutdown().await;
+    }
+
+    // T11-04：连续失败逐轮调度时退避计数逐级递增，shutdown 后归零
+    #[tokio::test]
+    async fn reconnect_scheduling_escalates_and_shutdown_resets() {
+        let (m, _sink) = test_manager();
+        let peer = "192.0.2.1".to_string();
+        m.set_peer_ip_provider(Arc::new(move || Some(peer.clone())));
+        m.set_reconnect(true);
+        assert!(m.start_reconnect());
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 1);
+        // 每轮失败后再次调度，attempts 必须递增（对应 5s→10s→20s 档位）
+        assert!(m.start_reconnect());
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 2);
+        assert!(m.start_reconnect());
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 3);
+        m.shutdown().await;
+        assert_eq!(
+            m.core.reconnect.lock().unwrap().attempts,
+            0,
+            "shutdown 应取消待执行重连并重置计数"
+        );
+        assert!(!m.start_reconnect(), "shutdown 后不得再安排重连");
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0);
+    }
+
+    // T11-04：握手成功后重置退避计数（即使连接由自动重连路径发起、未预先清零）
+    #[tokio::test]
+    async fn successful_handshake_resets_reconnect_attempts() {
+        let (m, sink) = test_manager();
+        m.set_peer_ip_provider(Arc::new(|| Some("127.0.0.1".to_string())));
+        {
+            let mut rs = m.core.reconnect.lock().unwrap();
+            rs.attempts = 9;
+        }
+        let listen = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listen.local_addr().unwrap().port();
+        m.connect_inner("127.0.0.1", port, false).await.unwrap();
+        let (stream, _) = listen.accept().await.unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+        // 出站：管理端先发 hello，我们回 hello 完成握手
+        let mhello = read_any(&mut rd).await;
+        assert_eq!(mhello.msg_type, protocol::MSG_HELLO);
+        protocol::validate_hello(&mhello, TEST_PEER_DEVICE_ID).unwrap();
+        let hello = protocol::Message::new(
+            protocol::MSG_HELLO,
+            TEST_PEER_DEVICE_ID,
+            &protocol::HelloPayload {
+                device_id: TEST_PEER_DEVICE_ID.to_string(),
+                device_name: "TEST-PEER-B".to_string(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+        wr.write_all(&protocol::encode(&hello).unwrap())
+            .await
+            .unwrap();
+        let mut connected = false;
+        for _ in 0..40 {
+            if sink
+                .last()
+                .is_some_and(|e| e.status == ConnectionStatus::Connected)
+            {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(connected, "握手成功后应进入 Connected");
+        assert_eq!(
+            m.core.reconnect.lock().unwrap().attempts,
+            0,
+            "握手成功后应重置退避计数"
+        );
+        m.disconnect().await;
+        m.shutdown().await;
+    }
+
+    // T11-04：用户主动断开取消待执行重连并重置计数
+    #[tokio::test]
+    async fn disconnect_cancels_and_resets_reconnect() {
+        let (m, _sink) = test_manager();
+        let peer = "192.0.2.1".to_string();
+        m.set_peer_ip_provider(Arc::new(move || Some(peer.clone())));
+        m.set_reconnect(true);
+        assert!(m.start_reconnect(), "应存在待执行的重连");
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 1);
+        m.disconnect().await; // 无活动连接时仍应取消未完成重连并重置
+        assert_eq!(
+            m.core.reconnect.lock().unwrap().attempts,
+            0,
+            "用户主动断开应重置重连计数"
+        );
+        // 重连开关仍开启：再调度应从 0 重新起算（若无重置此处应为 2）
+        assert!(m.start_reconnect());
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 1);
+        m.shutdown().await;
+    }
+
+    // T11-04：shutdown 置退出门槛后，残留延迟任务/后续 finalize 不得再安排或执行重连
+    #[tokio::test]
+    async fn shutdown_blocks_reconnect_scheduling_and_attempts() {
+        let (m, _sink) = test_manager();
+        let peer = "192.0.2.1".to_string();
+        m.set_peer_ip_provider(Arc::new(move || Some(peer.clone())));
+        m.set_reconnect(true);
+        assert!(m.start_reconnect(), "应有待执行重连");
+        m.shutdown().await;
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0);
+        // 残留 finalize 可能再次调用 start_reconnect：必须被退出门槛拒绝
+        assert!(!m.start_reconnect(), "shutdown 后不得再安排重连");
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0);
+        // 残留延迟任务即使醒来（token 已取消，模拟直接调用）也不得发起连接
+        m.reconnect_attempt("192.0.2.1".to_string(), 45888).await;
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0);
+        assert!(!m.is_busy(), "shutdown 后不得发起新连接");
     }
 }
