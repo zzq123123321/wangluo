@@ -216,7 +216,8 @@ struct NetCore {
 struct NetInner {
     next_generation: u64,
     listener: Option<ListenerSlot>,
-    /// 最近一次绑定/尝试绑定的 ZeroTier IP：相同 IP 重复通知时幂等，不重复启动监听器
+    /// 当前成功绑定的 ZeroTier IP（T11-05）：仅在 bind 成功后写回；失败不记录目标值。
+    /// 幂等判断同时要求 listener 仍在，listener 缺失时同 IP 也会重试 bind。
     bind_ip: Option<String>,
     conn: Option<ConnSlot>,
 }
@@ -381,17 +382,22 @@ impl NetworkManager {
 
     /// 按当前 ZeroTier IP 启停 listener（幂等）：
     /// - None → 停止监听（IP 失效时不再监听失效地址）
-    /// - Some(ip) 与上次相同 → 无操作（不重复启动）
-    /// - Some(ip) 变化 → 取消旧监听任务，绑定 <ip>:port；绑定失败只记录错误类型与地址，不 panic。
+    /// - Some(ip) 与上次相同且 listener 仍在 → 无操作（不重复 bind/spawn）
+    /// - Some(ip) 变化或 listener 缺失 → 取消旧监听任务，绑定 <ip>:port；
+    ///   绑定失败不写回成功值（bind_ip 恒为"当前成功绑定的 IP"），下一次同 IP 可重试；
+    ///   绑定失败只记录错误类型与地址，不 panic。
     pub async fn sync_listener(&self, zt_ip: Option<&str>) {
         let want = zt_ip.map(str::to_string);
-        let (old_cancel, last) = {
+        let (old_cancel, last, active) = {
             let g = self.core.inner.lock().unwrap();
             let last = g.bind_ip.clone();
+            let active = g.listener.is_some();
             let c = g.listener.as_ref().map(|l| l.cancel.clone());
-            (c, last)
+            (c, last, active)
         };
-        if last == want {
+        // T11-05：幂等必须同时要求 listener 仍在——若 listener 缺失（如上次 bind 失败），
+        // 即使 bind_ip 与目标一致也要重试 bind，否则一次临时失败会把同 IP 永久锁死。
+        if last == want && active {
             return;
         }
         if let Some(c) = old_cancel {
@@ -404,14 +410,12 @@ impl NetworkManager {
             tracing::info!("ZeroTier IP 失效，监听已停止");
             return;
         };
-        {
-            let mut g = self.core.inner.lock().unwrap();
-            g.bind_ip = Some(target.clone());
-        }
         let bind_addr = match target.parse::<Ipv4Addr>() {
             Ok(ip) => SocketAddr::new(ip.into(), self.core.cfg.port),
             Err(_) => {
                 tracing::warn!(ip=%target, "ZeroTier IP 非法，未启动监听");
+                let mut g = self.core.inner.lock().unwrap();
+                g.listener = None;
                 return;
             }
         };
@@ -425,6 +429,8 @@ impl NetworkManager {
                         addr: local,
                         cancel: cancel.clone(),
                     });
+                    // T11-05：bind 真正成功后才写回成功值；失败不作为"已绑定"记录
+                    g.bind_ip = Some(target.clone());
                 }
                 tracing::info!(addr=%local, "TCP 监听已启动");
                 let m = self.clone();
@@ -435,10 +441,11 @@ impl NetworkManager {
             Err(e) => {
                 let mut g = self.core.inner.lock().unwrap();
                 g.listener = None;
+                // bind_ip 保持上一次成功值（或 None）：一次临时失败后同 IP 仍会重试
                 tracing::warn!(
                     addr = %bind_addr,
                     kind = %e.kind(),
-                    "TCP 监听绑定失败（端口可能被占用）"
+                    "TCP 监听绑定失败（端口可能被占用）；下次同 IP 检测将重试"
                 );
             }
         }
@@ -1203,6 +1210,9 @@ mod tests {
         fn last(&self) -> Option<ConnectionStatusEvent> {
             self.0.lock().unwrap().last().cloned()
         }
+        fn count(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
     }
 
     impl StatusSink for VecSink {
@@ -1218,6 +1228,24 @@ mod tests {
             "TEST-A".into(),
             ManagerConfig {
                 port: 0,
+                heartbeat_secs: 1,
+                handshake_timeout: Duration::from_millis(300),
+                connect_timeout: Duration::from_millis(300),
+                reconnect: false,
+            },
+            sink.clone(),
+        );
+        (m, sink)
+    }
+
+    /// 指定监听端口的管理器（listener 绑定测试用；port=0 由系统分配空闲端口）。
+    fn test_manager_with_port(port: u16) -> (NetworkManager, Arc<VecSink>) {
+        let sink = Arc::new(VecSink::new());
+        let m = NetworkManager::new(
+            "550e8400-e29b-41d4-a716-446655440000".into(),
+            "TEST-A".into(),
+            ManagerConfig {
+                port,
                 heartbeat_secs: 1,
                 handshake_timeout: Duration::from_millis(300),
                 connect_timeout: Duration::from_millis(300),
@@ -1579,5 +1607,185 @@ mod tests {
         m.reconnect_attempt("192.0.2.1".to_string(), 45888).await;
         assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0);
         assert!(!m.is_busy(), "shutdown 后不得发起新连接");
+    }
+
+    // T11-05：listener bind 临时失败后，同一 IP 后续必须能重新尝试（不依赖真实 ZeroTier）。
+    // 修复前 bind_ip 在 bind 前就写成目标值，失败后同 IP 被幂等逻辑永久跳过。
+    #[tokio::test]
+    async fn listener_bind_failure_retries_same_ip() {
+        // 占用一个端口制造 bind 失败（Windows/Unix 上无 SO_REUSEADDR 时二次绑定必然失败）
+        let occ = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = occ.local_addr().unwrap().port();
+        let (m, _sink) = test_manager_with_port(port);
+        m.sync_listener(Some("127.0.0.1")).await;
+        assert!(
+            m.listener_local_addr().is_none(),
+            "端口被占用时 bind 应失败，listener 槽保持空"
+        );
+        assert!(
+            m.core.inner.lock().unwrap().bind_ip.is_none(),
+            "bind 失败不得把目标 IP 记为已成功绑定"
+        );
+        // 释放占用后，同 IP 重复 sync 必须最终重试成功（原 bug：幂等早退导致永不重试）。
+        // 用重复 sync 验证"失败不会把同 IP 永久锁死在幂等 return"。
+        drop(occ);
+        let mut bound = false;
+        for _ in 0..20 {
+            m.sync_listener(Some("127.0.0.1")).await;
+            if m.listener_local_addr().is_some() {
+                bound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let addr = m
+            .listener_local_addr()
+            .expect("释放端口后，同 IP 应重试绑定成功");
+        assert!(bound, "同 IP 应能重试成功");
+        assert_eq!(addr.port(), port, "应绑定回同一个端口");
+        assert_eq!(
+            m.core.inner.lock().unwrap().bind_ip.as_deref(),
+            Some("127.0.0.1")
+        );
+        m.shutdown().await;
+    }
+
+    // T11-05：listener 同 IP 幂等——listener 存活时重复 sync 不替换、不重复 spawn。
+    #[tokio::test]
+    async fn listener_same_ip_is_idempotent() {
+        let (m, _sink) = test_manager_with_port(0);
+        m.sync_listener(Some("127.0.0.1")).await;
+        let addr = m.listener_local_addr().expect("首次绑定应成功");
+        let bind_ip = m.core.inner.lock().unwrap().bind_ip.clone();
+        m.sync_listener(Some("127.0.0.1")).await;
+        assert_eq!(
+            m.listener_local_addr(),
+            Some(addr),
+            "同 IP 重复 sync 不得替换 listener（端口 0 会重新分配，替换则地址必变）"
+        );
+        assert_eq!(
+            m.core.inner.lock().unwrap().bind_ip,
+            bind_ip,
+            "bind_ip 不得变化"
+        );
+        // 幂等后该地址仍是唯一活动监听：再次绑定同一地址必须失败（无重复监听）
+        let dup = tokio::net::TcpListener::bind(addr).await;
+        assert!(dup.is_err(), "同 IP 幂等后不得存在第二个监听");
+        m.shutdown().await;
+    }
+
+    // T11-05：listener IP 变化安全重绑——停旧绑新，仅保留一个监听。
+    #[tokio::test]
+    async fn listener_ip_change_rebinds() {
+        // 固定端口：先占用再释放一个空闲端口，作为管理器监听端口
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (m, _sink) = test_manager_with_port(port);
+        m.sync_listener(Some("127.0.0.1")).await;
+        let addr_old = m.listener_local_addr().expect("首次绑定应成功");
+        assert_eq!(addr_old.port(), port);
+        m.sync_listener(Some("127.0.0.2")).await; // 同一端口、不同回环 IP
+        let addr_new = m.listener_local_addr().expect("新 IP 应绑定成功");
+        assert_eq!(
+            addr_new.ip(),
+            "127.0.0.2".parse::<std::net::Ipv4Addr>().unwrap(),
+            "监听应切换到新 IP"
+        );
+        assert_eq!(addr_new.port(), port, "端口保持一致");
+        assert_eq!(
+            m.core.inner.lock().unwrap().bind_ip.as_deref(),
+            Some("127.0.0.2")
+        );
+        // 旧 listener 已退出：旧地址可以重新绑定（轮询等待 accept_loop 退出释放端口）
+        let mut rebound = false;
+        for _ in 0..20 {
+            if tokio::net::TcpListener::bind(addr_old).await.is_ok() {
+                rebound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            rebound,
+            "旧 listener 退出后旧地址应可重新绑定（无重复监听）"
+        );
+        m.sync_listener(None).await;
+        assert!(m.listener_local_addr().is_none(), "None 应停止监听");
+        assert!(m.core.inner.lock().unwrap().bind_ip.is_none());
+        m.shutdown().await;
+    }
+
+    // T11-05：已有活动连接时，残留/醒来的自动重连任务必须停止：
+    // 不发起第二条连接、不续排重连、不覆盖当前连接状态。
+    #[tokio::test]
+    async fn reconnect_stops_when_connection_active() {
+        let (m, sink) = test_manager();
+        m.set_reconnect(true);
+        let conn = m.claim_conn().unwrap();
+        let gen = conn.generation;
+        let before_count = sink.count();
+        m.reconnect_attempt("192.0.2.1".to_string(), 45888).await;
+        assert!(m.is_busy(), "已有连接不得被重连任务影响");
+        assert_eq!(
+            m.core
+                .inner
+                .lock()
+                .unwrap()
+                .conn
+                .as_ref()
+                .unwrap()
+                .generation,
+            gen,
+            "不得替换已建连接"
+        );
+        assert_eq!(
+            m.core.reconnect.lock().unwrap().attempts,
+            0,
+            "已有连接时不得续排新的重连任务"
+        );
+        assert_eq!(
+            sink.count(),
+            before_count,
+            "不得发出 Reconnecting/Connecting 覆盖事件"
+        );
+        m.finalize(conn, CloseCause::User);
+        m.shutdown().await;
+    }
+
+    // T11-05：connect_inner 竞争——槽位已被抢先占用时返回 AlreadyConnected，
+    // 不覆盖既有连接、不排自动重连、不发状态事件。
+    #[tokio::test]
+    async fn connect_race_does_not_schedule_or_override() {
+        let (m, sink) = test_manager();
+        m.set_reconnect(true);
+        let conn = m.claim_conn().unwrap();
+        let gen = conn.generation;
+        let before_count = sink.count();
+        let r = m.connect("192.0.2.1", 45888).await;
+        assert!(
+            matches!(r, Err(AppError::AlreadyConnected)),
+            "槽位被占时 connect 应报 AlreadyConnected，得到 {r:?}"
+        );
+        assert_eq!(
+            m.core
+                .inner
+                .lock()
+                .unwrap()
+                .conn
+                .as_ref()
+                .unwrap()
+                .generation,
+            gen,
+            "失败路径不得覆盖已建连接"
+        );
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0, "不得排重连");
+        assert_eq!(
+            sink.count(),
+            before_count,
+            "不得发出 Connecting/Reconnecting 事件"
+        );
+        m.finalize(conn, CloseCause::User);
+        m.shutdown().await;
     }
 }

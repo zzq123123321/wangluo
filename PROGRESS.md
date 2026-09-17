@@ -31,6 +31,22 @@
   - **顺带加固：`reconnect_attempt` 连接请求失败但期间已有连接接管时**，不再无条件 emit Reconnecting / 续排重连，避免覆盖新连接状态。
   - 新增 6 个单元测试（自动路径不清零、用户 connect 重置、逐轮递增+shutdown 归零、握手成功重置、disconnect 重置、shutdown 封禁重连），3 个原生命周期测试全部保留。
   - 提交：`fix: harden network connection lifecycle`（已推送 origin/main）。
+- T11-05 PASS：双端同时连接/自动重连收敛与 listener 生命周期审查 + 修复。
+  - **发现并修复：listener bind 临时失败后同一 IP 被幂等逻辑永久锁死**——原实现把 `bind_ip`
+    在真正 `TcpListener::bind` 成功前就写成目标值；bind 失败后 `listener=None` 但 `bind_ip`
+    仍等于 target，下一轮 `sync_listener(same target)` 因 `bind_ip == want` 直接幂等早退，
+    该 ZeroTier IP 后续永远不会自动重新监听（除非 IP 先变化）。修复：`bind_ip` 语义改为
+    "当前成功绑定的 IP"（仅在 bind 成功后写回），且幂等判断同时要求 `listener.is_some()`；
+    同 IP + listener 存活 → no-op；同 IP + listener 缺失 → 重试 bind。
+  - **审查确认（无其余 bug）**：双方同时主动连接的收敛路径成立——单槽位互斥使对方入站被拒、
+    双双释放槽位进入重连、device_id 固定抖动保证错峰、一方先醒重连成功、另一方以其入站接入、
+    最终双方 Connected 且仅一条通道。入站 busy 分支只关闭新 socket（不影响活动连接）；
+    自动重连醒来时 `is_busy()` 则停止本轮不续排不覆盖；`connect_inner` 抢槽竞争返回
+    `AlreadyConnected`，用户路径透传错误、重连路径按 busy 停止，不排重连不覆盖状态。
+    旧 listener 的晚到 accept/error 不写回 listener/bind_ip 状态。
+  - 新增 5 个单元测试（bind 失败后同 IP 重试、同 IP 幂等不重复、IP 变化安全重绑、已有连接时
+    重连任务停止、connect 抢槽竞争不排不覆盖），8 个原生命周期测试全部保留。
+  - 提交：`fix: harden reconnect and listener convergence`（已推送 origin/main）。
 
 ## 环境事实（2026-09-16 核验）
 
@@ -279,5 +295,5 @@
 
 ## 下一步（阶段 11：测试和发布）
 
-1. T11-04 网络连接生命周期审查与修复已完成（见上方 T11 进展）。
-2. 下一轮等待总指挥下发 T11-05。
+1. T11-05 双端同连收敛与 listener 生命周期审查/修复已完成（见上方 T11 进展）。
+2. 下一轮等待总指挥下发 T11-06。
