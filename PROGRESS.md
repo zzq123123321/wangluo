@@ -96,6 +96,27 @@
     `--minimized` 启动无主窗无呼吸灯；启动修复真实触发（配置开启 + Run 项指向旧 exe →
     启动后重写为当前 exe）。验证后环境已还原（配置、Run 键、备份文件、进程全部清理）。
   - 提交：`fix: harden tray and autostart lifecycle`（已推送 origin/main）。
+- T11-08 PASS：网络异常路径与协议健壮性测试补强。
+  - **未发现新的生产代码缺陷，补充异常路径测试覆盖**——握手/帧/数据面异常路径审计后确认
+    现有实现已正确处理：握手阶段非 hello 消息经 `validate_hello` 判 `InvalidHello` 失败关闭；
+    握手阶段非法 JSON / 超大前缀在分配正文缓冲前被 `read_message` 拒绝；版本不兼容回
+    `error(version_mismatch)` 后关闭；运行中未知消息类型与重复 hello 按宽容策略忽略不中断连接；
+    malformed clipboard_update 只忽略不炸连接；各异常路径都经 `finalize`（generation 匹配 +
+    settled 标记）释放槽位，符合"不 panic / 不泄漏槽位 / 不覆盖新 generation / 不死循环"目标。
+  - 新增 6 个集成测试（`tests/tcp_loopback.rs`）：握手阶段非 hello 首消息 → `invalid_hello` +
+    槽位释放；握手阶段非法 JSON → `protocol_invalid_json` + 槽位释放；握手阶段对端立即 EOF →
+    Error + 槽位释放；hello 版本不兼容 → 本端回 `error` 帧 + `protocol_version_mismatch` +
+    槽位释放；运行中未知消息类型/重复 hello 忽略且连接保持可用（随后 ping/pong 正常）；异常结束
+    后下一条连接仍能建立（不被 AlreadyConnected 卡死）。
+  - 强化 `clipboard_update_flow_and_dedup`：补 payload 缺字段（无 text/content_hash）忽略断言，
+    并新增"坏消息后合法 clipboard_update 仍能落地"证明数据面坏消息不炸整条连接。
+  - 原有异常覆盖确认无需重复：握手超时（`no_hello_handshake_timeout` 入站+出站）、超大 frame
+    拒绝在分配前（`overlong_length_rejected_without_allocation`）、运行中非法 JSON/超长帧
+    （`invalid_json_and_utf8_no_crash` / `overlong_frame_closes_connection`）、
+    generation/finalize 不变量（`stale_generation_cannot_touch_new_connection`）。
+  - 测试：**98 单元 + 18 集成 = 116/116 通过**（新增 6 集成，原 109 全部保留），
+    `cargo fmt --check`/`cargo check`/`npm run build`/`git diff --check` 全绿。
+  - 提交：`test: strengthen protocol failure coverage`（已推送 origin/main）。
 
 ## 环境事实（2026-09-16 核验）
 
@@ -345,4 +366,5 @@
 ## 下一步（阶段 11：测试和发布）
 
 1. T11-07 托盘/开机启动/窗口关闭/退出生命周期审查与修复已完成（见上方 T11 进展）。
-2. 下一轮等待总指挥下发 T11-08。
+2. T11-08 网络异常路径与协议健壮性测试补强已完成（见上方 T11 进展）。
+3. 下一轮等待总指挥下发 T11-09。

@@ -4,7 +4,8 @@
 use cliplink_lib::identity::hex_encode;
 use cliplink_lib::network::{ConnectionStatusEvent, ManagerConfig, NetworkManager, StatusSink};
 use cliplink_lib::protocol::{
-    self, ClipboardPayload, DisconnectPayload, HelloPayload, Message, PingPayload, PongPayload,
+    self, ClipboardPayload, DisconnectPayload, ErrorPayload, HelloPayload, Message, PingPayload,
+    PongPayload,
 };
 use cliplink_lib::state::ConnectionStatus;
 use sha2::{Digest, Sha256};
@@ -562,6 +563,26 @@ fn clipboard_update_flow_and_dedup() {
         assert_eq!(landed.lock().unwrap().len(), 2, "哈希不匹配不应落地");
         assert_eq!(sink.last().unwrap().status, ConnectionStatus::Connected);
 
+        // payload 缺字段（无 text / content_hash）：反序列化失败 → 忽略且不中断连接
+        let missing = Message::new("clipboard_update", PEER_DEVICE_ID, &serde_json::json!({}))
+            .unwrap()
+            .with_message_id("cb-missing".to_string());
+        client_send(&mut cwr, &missing).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(landed.lock().unwrap().len(), 2, "缺字段 payload 不应落地");
+        assert_eq!(sink.last().unwrap().status, ConnectionStatus::Connected);
+
+        // 坏消息后仍能同步合法剪贴板：连接保持可用（数据面坏消息不炸连接）
+        let good_after_bad = clipboard_msg_with_id("cb-after-bad", "可以在坏消息后继续同步");
+        client_send(&mut cwr, &good_after_bad).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        {
+            let got = landed.lock().unwrap();
+            assert_eq!(got.len(), 3, "坏消息之后的合法更新应落地");
+            assert_eq!(got[2].text, "可以在坏消息后继续同步");
+        }
+        assert_eq!(sink.last().unwrap().status, ConnectionStatus::Connected);
+
         m.disconnect().await;
         assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Offline).await);
         m.shutdown().await;
@@ -594,6 +615,246 @@ fn outbound_clipboard_update_reaches_peer() {
         assert_eq!(p.text, text);
         assert_eq!(p.content_hash, sha256_hex(text));
 
+        m.disconnect().await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Offline).await);
+        m.shutdown().await;
+    });
+}
+
+// ==== T11-08：网络异常路径与协议健壮性测试 ====
+
+// T11-08-A：握手阶段第一条消息不是 hello（合法 JSON 的 ping）→ 握手失败、连接关闭、槽位释放
+#[test]
+fn handshake_rejects_non_hello_first_message() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    tauri::async_runtime::block_on(async move {
+        m.sync_listener(Some("127.0.0.1")).await;
+        let addr = m.listener_local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_rd, mut wr) = stream.into_split();
+        // TCP 建立后第一帧就是 ping：JSON 合法、Version=1，但类型不是 hello
+        client_send(
+            &mut wr,
+            &Message::new(
+                "ping",
+                PEER_DEVICE_ID,
+                &PingPayload {
+                    ping_id: "fake".into(),
+                    sent_at: 1,
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        assert!(
+            wait_for(&sink, |e| {
+                e.status == ConnectionStatus::Error
+                    && e.error_code.as_deref() == Some("invalid_hello")
+            })
+            .await,
+            "非 hello 首消息应判握手失败，最近事件: {:?}",
+            sink.last()
+        );
+        assert!(!m.is_busy(), "握手失败后槽位必须释放");
+        m.shutdown().await;
+    });
+}
+
+// T11-08-A2：握手阶段第一条消息是非法 JSON → 握手失败、关闭、槽位释放（正确对待合法长度+坏正文）
+#[test]
+fn handshake_rejects_invalid_json_first_message() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    tauri::async_runtime::block_on(async move {
+        m.sync_listener(Some("127.0.0.1")).await;
+        let addr = m.listener_local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_rd, mut wr) = stream.into_split();
+        let body = b"this is not json";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        wr.write_all(&frame).await.unwrap();
+        assert!(
+            wait_for(&sink, |e| {
+                e.status == ConnectionStatus::Error
+                    && e.error_code.as_deref() == Some("protocol_invalid_json")
+            })
+            .await,
+            "握手阶段非法 JSON 应失败，最近事件: {:?}",
+            sink.last()
+        );
+        assert!(!m.is_busy(), "握手失败后槽位必须释放");
+        m.shutdown().await;
+    });
+}
+
+// T11-08-B：对端握手阶段即 EOF（连接后立即关闭，不发任何数据）→ 读写识别中断、槽位释放
+#[test]
+fn peer_eof_during_handshake_releases_slot() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    tauri::async_runtime::block_on(async move {
+        m.sync_listener(Some("127.0.0.1")).await;
+        let addr = m.listener_local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        drop(stream); // 立即关闭，不发 hello
+        assert!(
+            wait_for(&sink, |e| e.status == ConnectionStatus::Error).await,
+            "握手阶段 EOF 应产生 Error 事件，最近事件: {:?}",
+            sink.last()
+        );
+        assert!(!m.is_busy(), "握手阶段 EOF 后槽位必须释放");
+        m.shutdown().await;
+    });
+}
+
+// T11-08-C：握手 hello 版本不兼容 → 本端回 error(version_mismatch) 后关闭连接、槽位释放
+#[test]
+fn version_mismatch_sends_error_and_releases_slot() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    tauri::async_runtime::block_on(async move {
+        m.sync_listener(Some("127.0.0.1")).await;
+        let addr = m.listener_local_addr().unwrap();
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+        let mut bad = peer_hello();
+        bad.version = 2; // 协议版本不兼容
+        client_send(&mut wr, &bad).await;
+        // 本端应回 error 帧（reason = version_mismatch）
+        let err = client_read(&mut rd).await;
+        assert_eq!(err.msg_type, "error", "应收到 error 帧");
+        let ep: ErrorPayload = serde_json::from_value(err.payload).unwrap();
+        assert_eq!(ep.reason, "version_mismatch");
+        assert!(
+            wait_for(&sink, |e| {
+                e.status == ConnectionStatus::Error
+                    && e.error_code.as_deref() == Some("protocol_version_mismatch")
+            })
+            .await,
+            "版本不兼容应进入 Error 状态，最近事件: {:?}",
+            sink.last()
+        );
+        assert!(!m.is_busy(), "版本不兼容后槽位必须释放");
+        m.shutdown().await;
+    });
+}
+
+// T11-08-D：运行中收到未知消息类型 → 明确忽略、保持连接，随后 ping/pong 正常（宽容策略）
+#[test]
+fn unknown_message_type_does_not_kill_connection() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    tauri::async_runtime::block_on(async move {
+        let (mut crd, mut cwr, _addr, _paddr) = establish_inbound(&m).await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
+        client_send(
+            &mut cwr,
+            &Message::new(
+                "future_unknown_type",
+                PEER_DEVICE_ID,
+                &serde_json::json!({"future": true}),
+            )
+            .unwrap(),
+        )
+        .await;
+        // 未知消息后仍能 ping → pong：连接未断
+        client_send(
+            &mut cwr,
+            &Message::new(
+                "ping",
+                PEER_DEVICE_ID,
+                &PingPayload {
+                    ping_id: "uk-1".into(),
+                    sent_at: 1,
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        let pong = client_await(&mut crd, &mut cwr, "pong").await;
+        assert_eq!(pong.msg_type, "pong", "未知消息后应仍能收到 pong");
+        assert_eq!(sink.last().unwrap().status, ConnectionStatus::Connected);
+        m.disconnect().await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Offline).await);
+        m.shutdown().await;
+    });
+}
+
+// T11-08-E：运行中收到重复 hello → 明确忽略（当前宽容策略），连接保持可用
+#[test]
+fn duplicate_hello_ignored_and_connection_survives() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    tauri::async_runtime::block_on(async move {
+        let (mut crd, mut cwr, _addr, _paddr) = establish_inbound(&m).await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
+        // 已连接后再发一个合法 hello：应被忽略，不得断开/重新握手
+        client_send(&mut cwr, &peer_hello()).await;
+        client_send(
+            &mut cwr,
+            &Message::new(
+                "ping",
+                PEER_DEVICE_ID,
+                &PingPayload {
+                    ping_id: "dup-1".into(),
+                    sent_at: 1,
+                },
+            )
+            .unwrap(),
+        )
+        .await;
+        let pong = client_await(&mut crd, &mut cwr, "pong").await;
+        assert_eq!(pong.msg_type, "pong", "重复 hello 后应仍能收到 pong");
+        assert_eq!(sink.last().unwrap().status, ConnectionStatus::Connected);
+        m.disconnect().await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Offline).await);
+        m.shutdown().await;
+    });
+}
+
+// T11-08-F：异常结束后下一条连接仍能建立（不被 AlreadyConnected/残留槽位永久卡死）
+#[test]
+fn next_connection_works_after_abnormal_close() {
+    let sink = Arc::new(CollectSink::new());
+    let m = test_manager(sink.clone());
+    tauri::async_runtime::block_on(async move {
+        // 第一条连接以超大帧异常结束
+        let (crd, mut cwr, _addr, _paddr) = establish_inbound(&m).await;
+        assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Connected).await);
+        let mut frame = vec![0x00, 0x10, 0x00, 0x01]; // 长度 = 1 MiB + 1
+        frame.push(b'x');
+        cwr.write_all(&frame).await.unwrap();
+        assert!(
+            wait_for(&sink, |e| e.status == ConnectionStatus::Error).await,
+            "超大帧应使连接进入 Error"
+        );
+        assert!(!m.is_busy(), "异常连接结束后应释放槽位");
+        drop(cwr);
+        drop(crd);
+
+        // 第二条连接走完整出站握手 → 成功进入 Connected
+        let listen2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port2 = listen2.local_addr().unwrap().port();
+        m.connect("127.0.0.1", port2).await.unwrap();
+        let (stream2, _) = listen2.accept().await.unwrap();
+        let (mut crd2, mut cwr2) = stream2.into_split();
+        let mhello = client_await(&mut crd2, &mut cwr2, "hello").await;
+        protocol::validate_hello(&mhello, PEER_DEVICE_ID).expect("管理端 hello 校验失败");
+        client_send(&mut cwr2, &peer_hello()).await;
+        assert!(
+            wait_for(&sink, |e| {
+                e.status == ConnectionStatus::Connected
+                    && e.peer
+                        .as_ref()
+                        .is_some_and(|p| p.device_name == "TEST-PEER-B")
+            })
+            .await,
+            "异常结束后下一条连接应能建立，最近事件: {:?}",
+            sink.last()
+        );
         m.disconnect().await;
         assert!(wait_for(&sink, |e| e.status == ConnectionStatus::Offline).await);
         m.shutdown().await;
