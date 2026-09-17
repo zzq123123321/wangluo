@@ -18,7 +18,7 @@
 | 阶段 8 | 自动重连和冲突处理 | ✅ 完成（2026-09-17） |
 | 阶段 9 | 托盘和开机启动 | ✅ 完成（2026-09-17） |
 | 阶段 10 | 便携化改造（应用图标 + 免安装单文件，无安装包/防火墙） | ✅ 完成（2026-09-17） |
-| 阶段 11 | 测试和发布 | ⬜ 进行中（T11-01~03） |
+| 阶段 11 | 测试和发布 | ⬜ 进行中（T11-01~11；T11-11 双机验收 BLOCKED-待第二节点） |
 
 ## T11 审查与收尾进展（2026-09-17）
 
@@ -179,6 +179,25 @@
     `cargo fmt --check`/`cargo test -- --test-threads=1`/`cargo check`/`npm run build`/
     `git diff --check` 全绿。
   - 提交：`fix: polish release status feedback`（已推送 origin/main）。
+- T11-11 BLOCKED：真实双机基础连接 + A↔B 剪贴板验收——**无法控制第二台真实 Windows 节点**。
+  - 依据任务规则"无法控制第二台电脑 → 如实 BLOCKED，不伪造"；不执行任何伪造/单机环回替代。
+  - A 端（本开发机 MSI）状态：ZeroTier `xu_network` 在线，本机 ZT IP `192.168.191.180`；
+    新增监听确认（真实 EXE 启动冒烟，见下）始终绑定 `192.168.191.180:45888`，与产品"只绑定 ZT IP"一致。
+  - A 端已交付：以当前 HEAD（`95a572d`）重新 `tauri build --no-bundle` 构建成功，
+    `src-tauri\target\release\cliplink.exe`（2026-09-17 20:20:05，5 741 568 字节，
+    SHA-256 `9D30FB48B02BFEF2D541CAC3D08F58E812889464C6BE90B5431C35E5495C8B8D`）；
+    启动冒烟 PASS：进程存活、主窗口 "ClipLink"、按产品规范仅监听 `192.168.191.180:45888`。
+  - B 端无法交付事实（本轮向用户确认后不再探测网络设备）：
+    - 环境中未提供可在本轮使用、且经用户同意的第二台 Windows/ZeroTier 节点；
+    - 禁止本端自行扫描用户网络中其他设备（用户明确要求）；网络上无已知可用的既有控制通道
+      （此前发现的候选通道均无凭据/不可达，且不再继续试探）。
+  - 因此以下双机验收项全部未执行，不可声称通过：双方 Connected、真实 RTT、A→B/B→A 剪贴板
+    （中文/英文/Emoji/多行/重复/交替/最近同步）、日志正文检查、断线 RTT 清理等。
+  - 自动测试在双机验收尝试前后均保持全绿：cargo fmt --check / cargo check / npm run build 通过，
+    **cargo test 104 单元 + 18 集成 = 122/122**，git diff --check 通过，工作树本次提交后 clean。
+  - 已提交：`test: record t11-11 blocked -- second node unavailable`（已推送 origin/main）。
+  - 下一步解锁条件：由用户提供一个已授权并接入 `xu_network` 的第二台 Windows 电脑（最好已装
+    ZeroTier/可装），给出其对端可达信息与可用的命令控制通道，再重跑 T11-11。
 
 ## 环境事实（2026-09-16 核验）
 
