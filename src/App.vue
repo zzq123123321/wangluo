@@ -5,13 +5,14 @@ import StatusBanner from "./components/StatusBanner.vue";
 import LocalAddressCard from "./components/LocalAddressCard.vue";
 import ConnectCard from "./components/ConnectCard.vue";
 import PeerStatusCard from "./components/PeerStatusCard.vue";
-import { store, refreshSnapshot, updateSettings } from "./stores/app";
+import { store, refreshSnapshot, applySnapshot, updateSettings } from "./stores/app";
 import {
   STATUS_TEXT,
   type ConnectionStatusEvent,
   type ZtIpChangedEvent,
   type AppErrorEvent,
   type ClipboardSyncedEvent,
+  type AppSnapshot,
 } from "./types/app";
 import type { DemoKey } from "./stores/demo";
 
@@ -73,6 +74,11 @@ onMounted(async () => {
       if (store.demoState) return;
       store.lastSync = ev.payload.time;
     });
+    // 阶段 9：托盘内修改设置（暂停/恢复、开机启动）后同步前端
+    await listen<AppSnapshot>("settings-changed", (ev) => {
+      if (store.demoState) return;
+      applySnapshot(ev.payload);
+    });
   } catch {
     // 普通浏览器无 Tauri 运行时：无事件通道，开发页靠 demo 状态预览
   }
@@ -96,7 +102,7 @@ onMounted(async () => {
             type="checkbox"
             :checked="store.autostart"
             :disabled="!!store.demoState || !store.loaded"
-            title="保存开机启动偏好；系统开机启动功能阶段 11 接入"
+            title="写入注册表启动项（HKCU Run 键，开机静默到托盘）"
             @change="onAutostartChange"
           />
           <span>开机启动</span>

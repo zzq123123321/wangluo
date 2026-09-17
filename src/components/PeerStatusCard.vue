@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { store, disconnectPeer } from "../stores/app";
+import { store, disconnectPeer, togglePause } from "../stores/app";
 
 const borderTone = computed(() => {
   if (!store.peerDeviceName) return "";
@@ -27,7 +27,10 @@ const pauseDisabled = computed(
 );
 
 function pause() {
-  // 阶段 9 实现 set_sync_paused
+  void (async () => {
+    const err = await togglePause();
+    if (err) store.error = err;
+  })();
 }
 function onDisconnect() {
   void (async () => {

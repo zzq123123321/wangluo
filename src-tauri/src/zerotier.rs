@@ -18,6 +18,9 @@ pub const HINT_NOT_FOUND: &str =
 
 pub const STATUS_WAITING_INPUT: &str = "等待输入对方 IP。";
 pub const STATUS_NO_ZT: &str = "未发现 ZeroTier IP。";
+pub const STATUS_RECONNECTING: &str = "连接已中断，正在重试……";
+pub const STATUS_CONNECTED: &str = "已连接，剪贴板同步已开启。";
+pub const STATUS_PAUSED: &str = "已暂停同步。";
 
 /// 检测结果：能区分"未发现网卡"与"有网卡但没有有效 IPv4"，
 /// 但 ZeroTier 未启动 / 未入网 / 未授权在 GetAdaptersAddresses 层面无法可靠区分，统一归入前两者。

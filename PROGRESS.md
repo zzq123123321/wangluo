@@ -15,9 +15,9 @@
 | 阶段 5 | TCP 通信基础 | ✅ 完成（2026-09-16） |
 | 阶段 6 | 单机剪贴板监听 | ✅ 完成（2026-09-16） |
 | 阶段 7 | 双向同步 | ✅ 完成（2026-09-17） |
-| 阶段 8 | 自动重连和冲突处理 | ⬜ 未开始 |
-| 阶段 9 | 托盘和开机启动 | ⬜ 未开始 |
-| 阶段 10 | 安装包和防火墙 | ⬜ 未开始 |
+| 阶段 8 | 自动重连和冲突处理 | ✅ 完成（2026-09-17） |
+| 阶段 9 | 托盘和开机启动 | ✅ 完成（2026-09-17） |
+| 阶段 10 | 便携化改造（应用图标 + 免安装单文件，无安装包/防火墙） | ✅ 完成（2026-09-17） |
 | 阶段 11 | 测试和发布 | ⬜ 未开始 |
 
 ## 环境事实（2026-09-16 核验）
@@ -53,6 +53,10 @@
 18. `NetworkManager`（network.rs）：`Arc<NetCore>` 克隆开销为引用计数；状态事件经 `StatusSink` 单一出口（生产 `TauriStatusSink`：写 `AppState.inner` + emit `connection-status-changed`；测试用收集型 sink）。**事件按连接代次（generation）过滤**：非终结事件仅在槽位仍属于该 generation 时发出；终结事件（finalize）先比对槽位、匹配才清理并发出，旧连接任务不会覆盖新连接状态（settled AtomicBool 保证每连接只终结一次）。
 19. 心跳：`time::interval` 首个 tick 立即完成 → 握手完成后**立即发首个 ping**（属预期行为，对端回 pong 即可）；连续 3 次无匹配 pong 判 `heartbeat_timeout`；不匹配/过期 pong 不重置计数。
 20. writer 任务是唯一写 socket 的任务（mpsc 通道串行化所有帧）；收到取消信号时**先排空已入队帧**（如用户 disconnect 消息）再关闭，保证用户主动断开的 disconnect 帧一定发出。
+21. **阶段 8 自动重连（自驱式，无常驻任务）**：非用户断开且已保存对方 IP 时，`finalize` 用新 CancellationToken 调度"退避后单次尝试"，失败由连接任务 finalize 再调度（attempts 递增）；退避 2→5→10→20→30 封顶（秒），并叠加 **device_id 固定抖动 0~1500ms**（`reconnect_delay_ms`）——双方同时断线时若同步退避会在同一时刻互相占用槽位打结，抖动保证错峰收敛。用户 connect/disconnect/shutdown 均 `cancel_reconnect`（取消未完成延迟任务 + 重置计数）。
+22. **阶段 8 冲突处理不判 device_id**：单槽位下双方各自 connect 会先占住槽位，对方入站在 accept_loop busy 分支被拒、握手无法完成 → 曾实现 `CloseCause::ConflictLost` 出站判定，分析确认不可达后删除；靠"请求方退避错峰重连 + 另一方入站接入"收敛为单通道，满足"任何时刻只保留一个同步通道"。
+23. **阶段 9 开机启动不用插件，用系统 reg.exe**：crates.io 网络按环境决策不可假设可用，且插件需额外编译依赖；HKCU `...\CurrentVersion\Run` 启动项无需管理员权限，值 `"\"<exe>\" --minimized"`（静默到托盘）。配置 `config.json` 是唯一权威：写入注册表成功才持久化配置；启动时若配置开启而注册项缺失（如被手动删除）自动补写，保证一致性。同理 tauri 系统托盘用内置 `TrayIconBuilder`，仅启用 tauri 的 `tray-icon` feature（无新增 crate）。
+24. **阶段 10 改为便携化交付（用户明确需求变更）**：用户自用可信网络场景 → 不要安装包、不做防火墙/安全功能、不需要 UAC。交付物是**单个可双击运行的 `cliplink.exe`**（`tauri build --no-bundle`，release 单文件，双击即运行，拷到其他电脑也直接运行）。原 NSIS 钩子方案（`nsis-hooks.nsh` + 内联防火墙脚本）整体移除；防火墙自检/一键放行功能按用户意向回退删除，不写任何入站规则、不改系统防火墙。图标已按阶段 10 换正式图标（`app-icon.svg/png` + `tauri icon` 全量再生成）。
 
 ## 阶段 6 完成记录（2026-09-16）
 
@@ -203,15 +207,67 @@
   - 集成测试仅覆盖 A→B 单方向落地链路；双机坐实需 4090 装 ClipLink 后（阶段 11 测试录）。
   - 阶段 6 提交 `2271036` + 阶段 7 新提交仍本地未推送（GitHub 443 不可达，网络恢复后 `git push origin main`）。
 
+## 阶段 8 完成记录（2026-09-17）
+
+- **自动重连（自驱式，无常驻轮询任务）**：
+  - 触发：连接任务终结 `finalize` 时，非用户断开（除 `CloseCause::User` 以外）且能读到已保存的对方 IP（`peer_ip_provider` → `AppState.inner.last_peer_ip`）→ `start_reconnect()` 返回 true：以新 `CancellationToken` 调度一轮"延迟后 `reconnect_attempt`"。尝试成功 → `connect` 进入正常握手，`drive` 中 `reconnect.attempts=0` 重置退避；尝试失败 → 连接任务 finalize 再触发 `start_reconnect`，attempts 递增。
+  - 退避：`RECONNECT_BACKOFF=[2,5,10,20,30]`（秒）封顶 30；`reconnect_delay_ms` 另叠加 **device_id 固定抖动 0~1500ms**（`bytes().fold(×31+) % 1500`），保证两台设备同时断线时错峰重试、不会在同一时刻互占槽位打结。
+  - 取消：`connect()`/`disconnect()`/`shutdown()` 均调 `cancel_reconnect()`（取消未完成延迟任务 + 重置计数）。用户主动断开不重连；用户再次连接前先清掉旧的重连任务。
+  - 开关：`ManagerConfig.reconnect`（`production()` 默认 true，测试显式 false）+ `NetCore.reconnect_enabled: AtomicBool`，运行时由 `AppConfig.auto_reconnect` 经 `set_reconnect` 同步。config.rs 新字段 `auto_reconnect`（`#[serde(default="default_true")]`，旧配置文件缺省视为开启；`AppConfig::new` 默认 true）。
+  - 状态呈现：非用户断开立即 emit `Reconnecting`（`zerotier::STATUS_RECONNECTING`="连接已中断，正在重试……"，新常量），不再先闪 Error；`reconnect_attempt` 中 `connect` 仅因"槽位/编码"失败（没进连接任务、无 finalize 驱动下一轮）时手动补发 `Reconnecting` 并再次 `start_reconnect`，UI 全程"重试中"直到成功或用户干预。无对方 IP 时不重连，走原 Error/Offline 文案。
+- **双方同时连接（冲突处理）**：不判 device_id。单槽位（`inner.conn`）设计下，双方各自 `connect` 会先占住槽位，对方的入站在 `accept_loop` busy 分支被立即 shutdown，握手无法完成——`drive` 内没有任何"两条连接同时握手成功"的状态可达。曾实现 `CloseCause::ConflictLost`（出站握手完成且对方 device_id 更小则静默放弃），经分析确认**不可达死代码**并删除（变体连同 finalize 静默分支、terminal 分支一并移除）。收敛路径：两侧各自错峰重连，先成功一方成为请求方，另一方空闲后以入站方式接入，最终仍是单条通道。
+- **重连期间剪贴板变化不补发**：`clipboard.rs` 仅在 Connected 时发送（既有逻辑，未改）；断线期间本地复制只更新 `last_clipboard_hash`/`last_clipboard_text`，不排队。恢复后若当前文本与最后发送不同则**只发一次**，中间历史状态不堆积发送，符合"旧内容不补发"。
+- **前端**：`types/app.ts` `AppSnapshot` 新增 `auto_reconnect`；`stores/app.ts` 新增 `autoReconnect`（默认 true）+ `refreshSnapshot` 读取。auto_reconnect 尚未接界面开关（数据已入 config+快照，阶段 9 设置/托盘时接 UI）。
+- **测试**：`cargo test -- --test-threads=1` **70 单元 + 11 集成 = 81/81 通过**。新增：
+  - `reconnect_backoff_sequence_and_jitter`：退避序列 2/5/10/20/30/30 端点、抖动落在 [base, base+1500ms)、两个不同 device_id 在相同 attempt 下抖动不同。
+  - `reconnect_toggled_by_set_reconnect`（#[tokio::test]）：关闭不调度且计数不递增；开启且有对方 IP 调度成功且计数+1；`cancel_reconnect` 取消待执行任务并重置计数。
+  - 既有 `ManagerConfig` 构造点（单测 `test_manager`、集成 `tests/tcp_loopback.rs`）补 `reconnect: false`，避免测试环境意外重连。
+- **构建**：`cargo fmt --check` 干净；`npm run build`（vue-tsc + vite）通过。
+- **遗留**：
+  - 阶段 8 的 8 个文件修改**尚未 git 提交**（命令规则：仅在用户要求时提交）；阶段 6 `2271036` 与阶段 7 `435f58c` 提交仍本地未推送（GitHub 443 不可达，网络恢复后 `git push origin main`）。
+  - 断线重连、同时连接的**真实双机实测**留阶段 11 集成测试录（本机 + 4090）；本阶段以单测覆盖退避/开关逻辑，端到端 reconnect 路径待实跑复核。
+  - `Reconnecting` 中转状态的 UI 视觉验收留独立视觉验收会话（本会话未做视觉验收）。
+
+## 阶段 9 完成记录（2026-09-17）
+
+- **系统托盘**（tray.rs，重写 1 行空壳）：tauri 内置 `TrayIconBuilder`（仅给 tauri 增开 `tray-icon` feature，无新增 crate）。菜单 6 项：当前状态（disabled、实时刷新）、打开主界面、暂停/恢复同步（CheckMenuItem 勾选即暂停态）、重新连接（`commands::do_connect` + 已保存对方 IP）、开机启动（CheckMenuItem）、退出 ClipLink（`app.exit(0)`，唯一结束进程入口）。`show_menu_on_left_click(false)` + 左键单击/双击托盘图标打开主界面（`show + unminimize + set_focus`）。
+- **TrayHandle 生命周期**：`setup` 返回的 `TrayHandle{_tray, menu}` 经 `app.manage` 持有到退出（托盘图标 Drop 会被移除，见 tauri 源码）；`menu` 供运行期 `menu.get(id)` + `as_menuitem`/`as_check_menuitem` 更新文案/勾选。
+- **关闭窗口只隐藏**：`Builder::on_window_event` 拦截 `CloseRequested` → `window.hide()` + `api.prevent_close()`；同步/监听/托盘继续运行，满足"窗口关闭后同步继续"（阶段 9 完成标准之一）。退出仅走托盘"退出 ClipLink"。
+- **开机启动**（autostart.rs，新模块）：`reg.exe` 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 值 `ClipLink` = `"\"<current_exe>\" --minimized"`；`reg_command(enabled, exe)` 纯函数构造参数（测试只验参数、不开真注册表）。**先注册表后配置**：`apply_user_settings`（命令与托盘共用入口）autostart 变更先 `autostart::apply`，成功才 `apply_settings` 落盘——注册表失败配置不会宣称已开启；删除时目标本就缺失视为幂等成功。启动时 `--minimized` 隐藏主窗口（静默到托盘），并做一次"配置开启但注册项缺失"的一致性补写。
+- **暂停/恢复语义**：`apply_settings` 在 Connected↔Paused 间切换 `status`+`status_text`（新常量 `zerotier::STATUS_CONNECTED`/`STATUS_PAUSED`，network.rs 原内联文案一并收敛到常量）；其他状态（离线/重连中/错误）只记 `paused` 标记不改写文案。下行对称暂停：`clipboard::land_remote` 暂停时不写入本机剪贴板（原先只暂停上行）。
+- **托盘 → 前端联动**：托盘改设置后 emit `settings-changed`（payload=AppSnapshot）+ 刷新托盘项；`stores/app.ts` 抽出 `applySnapshot(s)`（update_settings 返回、settings-changed 事件、refreshSnapshot 共用），新增 `togglePause()`；`App.vue` 监听 `settings-changed`；`PeerStatusCard.vue` 暂停按钮接线（原阶段 9 TODO）。
+- **auto_reconnect 设置入口**：`SettingsUpdate` 增 `auto_reconnect`，`apply_settings` 持久化 + `net.set_reconnect` 同步网络管理器开关（数据此前已在 config+快照，此刻补上接口；界面专项开关不在本阶段 UI 范围，托盘菜单按文档固定 6 项）。
+- **测试**：`cargo test -- --test-threads=1` **76 单元 + 11 集成 = 87/87 通过**（+6：autostart 三个参数构造用例、暂停 Connected↔Paused 文案、离线态暂停不改文案、auto_reconnect 持久化落盘）。
+- **构建**：`cargo fmt --check` 干净；`npm run build`（vue-tsc + vite）通过。
+- **遗留**：
+  - 阶段 8（8 文件）+ 本阶段（含 Cargo.toml feature）修改均**未 git 提交**（命令规则：仅在用户要求时提交）；阶段 6 `2271036`、阶段 7 `435f58c` 仍未推送（GitHub 443 不可达）。
+  - 托盘/开机启动/静默启动需**真实运行验证**（视觉与交互验收应放独立会话）：托盘图标出现、右键菜单各项、关闭窗口隐藏、双击托盘回主界面、开机启动项写入与 `--minimized` 静默、暂停/恢复与状态文案。
+  - `auto_reconnect` 界面开关、自动重连设置项 UI 未接界面（托盘菜单固定项之外；可在"打开设置"页面补，阶段 11 范围）。
+  - "打开设置"按钮仍为禁用（阶段 11 测试发布范围）。
+
+## 阶段 10 完成记录（2026-09-17，便携化）
+
+- **交付形态（需求变更）**：用户明确"不用安装包、双击就能运行的 exe，复制到其他电脑也双击就能运行；自己可信网络内使用，不需要安全功能"。→ 交付物 = `src-tauri\target\release\cliplink.exe`（`npm run tauri -- build --no-bundle`，单文件、双击即运行、无 UAC）。
+- **应用图标**：设计 `app-icon.svg`（渐变圆角方块 + 白色剪贴板 + 双向同步箭头）→ Edge headless（需 `--no-sandbox --user-data-dir` 与绝对输出路径）渲染 1024×1024 `app-icon.png` → `npm run tauri -- icon app-icon.png` 全量生成 `src-tauri/icons/`（32/128/128@2x/ico/icns/png + Android/iOS），exe/托盘/窗口图标统一生效。
+- **tauri.conf.json**：保留 publisher/copyright/category/shortDescription/longDescription/icon；移除 `windows.nsis`（installerHooks/languages/startMenuFolder）与 `bundle.resources`（firewall.ps1）——构建入口一律用 `--no-bundle`。
+- **移除**：`nsis-hooks.nsh`、`firewall.ps1`、以及整套安装包实验（NSIS 3.11 手动下载、PATH 增强构建 bat 等均为临场手段，未入库）。
+- **防火墙/安全**：按用户意向不做。曾实现"启动自检 + 一键提权添加规则"再被完整回退（firewall.rs、FirewallBanner.vue、两条 command、store 字段、App.vue 接线全部删除），代码库中不残留任何防火墙/安全逻辑，也不写规则。
+- **验证**：`cargo test` **76 单元 + 11 集成 = 87/87 通过**；`cargo fmt --check` 干净；`npm run build`（vue-tsc + vite）通过；便携 exe 启动冒烟通过（进程存活、GUI 拉出）。
+- **环境清理**：删除安装实验的 `$LOCALAPPDATA\ClipLink` 与开始菜单项（用户不要安装包）。测试期遗留了一条名 `ClipLink` 的防火墙入站规则（指向已删除的安装目录 exe），删除需管理员——若需清理请告知代理以一次 UAC 删除。
+- **遗留**：
+  - 阶段 8（8 文件）+ 阶段 9（含 Cargo.toml feature）+ 阶段 10 图标与配置修改均**未 git 提交**（命令规则：仅在用户要求时提交）；阶段 6 `2271036`、阶段 7 `435f58c` 仍未被推送（GitHub 443 不可达）。
+  - 便携 exe 的真实运行/界面视觉验收待独立视觉验收会话。
+
 ## 已知问题 / 待办
 
-- 开机启动复选框已持久化偏好值（阶段 4）；系统开机启动插件与"打开设置"按钮留阶段 9。
-- 图标仍为模板 tauri.svg（阶段 10 换正式图标并生成安装包图标）。
-- 两机真实互连（本机 + 4090）待 4090 装 ClipLink 后验证（见阶段 5 遗留）。
+- 两机真实互连（本机 + 4090）待 4090 运行 ClipLink 后验证（见阶段 5 遗留）——便携包直接拷到 4090 双击即可。
 - "未发现 ZeroTier IP"的真实运行场景未实测（本机 LLM API 依赖 ZT，见决策 14）；由单测覆盖，后续可在 4090 主机（不依赖 ZT 跑 LLM）上补测。
+- 托盘/开机启动/静默启动的**真实运行与视觉验收**待独立会话（见阶段 9 完成记录"遗留"）。
+- "打开设置"按钮禁用、`auto_reconnect` 界面开关未接（阶段 11 范围）。
 
-## 下一步（阶段 8：自动重连和冲突处理）
+## 下一步（阶段 11：测试和发布）
 
-1. 自动重连：断线（心跳超时/连接错误）后按 `last_peer_ip` 自动重连，限次/退避策略。
-2. 冲突处理：双向同时复制冲突时的策略（如最后一次写入胜出）；落地期间本地复制与远程落地的并发边界。
-3. 重连期间剪贴板变化的缓存/丢弃策略。
+1. 双机真实互连：便携 exe 拷到 4090（双击运行），本机 ↔ 4090 双向剪贴板同步、断线重连、暂停/恢复实测。
+2. 本机运行验证录：托盘、开机启动、静默启动、关闭隐藏、重新连接、自动重连手测。
+3. "打开设置"页面（auto_reconnect 开关等）与阶段 9 遗留 UI 项。
+4. 阶段 8/9/10 全部未提交修改按用户指示 git 提交；阶段 6/7 提交待 GitHub 443 恢复后推送。

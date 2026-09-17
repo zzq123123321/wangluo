@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="link" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#818CF8"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+
+  <rect x="392" y="190" width="240" height="118" rx="34" fill="#EEF2FF"/>
+  <rect x="458" y="148" width="108" height="38" rx="10" fill="#C7D2FE"/>
+
+  <rect x="272" y="300" width="480" height="552" rx="64" fill="#FFFFFF"/>
+  <rect x="276" y="304" width="472" height="544" rx="60" fill="none" stroke="#E0E7FF" stroke-width="8"/>
+
+  <g transform="translate(512, 512)" stroke="url(#link)" stroke-width="26" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M -56 -30 L 4 -30 M 52 -30 L 40 -56 M 52 -30 L 40 -4"/>
+    <path d="M 56 30 L -4 30 M -52 30 L -40 56 M -52 30 L -40 4"/>
+  </g>
+</svg>

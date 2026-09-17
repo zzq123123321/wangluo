@@ -60,6 +60,7 @@ fn test_manager(sink: Arc<CollectSink>) -> NetworkManager {
             heartbeat_secs: 1,
             handshake_timeout: Duration::from_millis(500),
             connect_timeout: Duration::from_millis(500),
+            reconnect: false,
         },
         sink,
     );

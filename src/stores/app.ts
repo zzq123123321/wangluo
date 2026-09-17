@@ -11,6 +11,7 @@ export const store = reactive<{
   appVersion: string;
   listenPort: number;
   autostart: boolean;
+  autoReconnect: boolean;
   lastPeerIp: string | null;
   zerotierIp: string | null;
   zerotierHint: string;
@@ -32,6 +33,7 @@ export const store = reactive<{
   appVersion: "",
   listenPort: 45888,
   autostart: false,
+  autoReconnect: true,
   lastPeerIp: null,
   zerotierIp: null,
   zerotierHint: "正在检测 ZeroTier 网络……",
@@ -60,39 +62,43 @@ export async function refreshSnapshot() {
   if (store.demoState) return;
   try {
     const s: AppSnapshot = await invoke("get_app_snapshot");
-    store.deviceId = s.device_id;
-    store.deviceName = s.device_name;
-    store.appVersion = s.app_version;
-    store.listenPort = s.listen_port;
-    store.autostart = s.autostart;
-    store.lastPeerIp = s.last_peer_ip;
-    // 首次加载后用已保存的对方 IP 回填输入框；之后不打断用户输入
-    if (!store.initialized) {
-      store.peerInput = s.last_peer_ip ?? "";
-      store.initialized = true;
-    }
-    store.zerotierIp = s.zerotier_ip;
-    store.zerotierHint = s.zerotier_hint;
-    store.hintWarn = s.hint_warn;
-    store.status = s.status;
-    store.statusText = s.status_text || STATUS_TEXT[s.status];
-    store.peerDeviceName = s.peer?.device_name ?? null;
-    store.peerIp = s.peer?.ip ?? null;
-    store.paused = s.paused;
-    store.lastSync = s.last_sync;
-    store.loaded = true;
+    applySnapshot(s);
   } catch (e) {
     store.error = String(e);
     store.statusText = String(e);
   }
 }
 
+/** 把后端快照同步到本地 store（refreshSnapshot 与 update_settings 返回、托盘设置更改共用） */
+export function applySnapshot(s: AppSnapshot) {
+  store.deviceId = s.device_id;
+  store.deviceName = s.device_name;
+  store.appVersion = s.app_version;
+  store.listenPort = s.listen_port;
+  store.autostart = s.autostart;
+  store.autoReconnect = s.auto_reconnect;
+  store.lastPeerIp = s.last_peer_ip;
+  // 首次加载后用已保存的对方 IP 回填输入框；之后不打断用户输入
+  if (!store.initialized) {
+    store.peerInput = s.last_peer_ip ?? "";
+    store.initialized = true;
+  }
+  store.zerotierIp = s.zerotier_ip;
+  store.zerotierHint = s.zerotier_hint;
+  store.hintWarn = s.hint_warn;
+  store.status = s.status;
+  store.statusText = s.status_text || STATUS_TEXT[s.status];
+  store.peerDeviceName = s.peer?.device_name ?? null;
+  store.peerIp = s.peer?.ip ?? null;
+  store.paused = s.paused;
+  store.lastSync = s.last_sync;
+  store.loaded = true;
+}
+
 /** 持久化设置；成功后用返回快照刷新本地非敏感状态 */
 export async function updateSettings(settings: SettingsUpdate): Promise<void> {
   const s: AppSnapshot = await invoke("update_settings", { settings });
-  store.autostart = s.autostart;
-  store.lastPeerIp = s.last_peer_ip;
-  store.paused = s.paused;
+  applySnapshot(s);
 }
 
 /** 保存对方 IP 输入（明确动作：失焦/回车触发，不按每次按键写盘）。
@@ -129,6 +135,17 @@ export async function disconnectPeer(): Promise<string | null> {
   if (store.demoState) return null;
   try {
     await invoke("disconnect_peer");
+    return null;
+  } catch (e) {
+    return String(e);
+  }
+}
+
+/** 暂停/恢复剪贴板同步（阶段 9）：状态由 update_settings 返回快照刷新 */
+export async function togglePause(): Promise<string | null> {
+  if (store.demoState) return null;
+  try {
+    await updateSettings({ syncPaused: !store.paused });
     return null;
   } catch (e) {
     return String(e);

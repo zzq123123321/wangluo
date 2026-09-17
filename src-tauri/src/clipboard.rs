@@ -153,6 +153,10 @@ fn send_update(state: &AppState, text: &str, hash: &str) {
 /// 2. 写入系统剪贴板
 /// 3. 更新本地观察哈希与最近同步时间，并向前端发出同步事件
 pub fn land_remote(state: Arc<AppState>, app: AppHandle, payload: &protocol::ClipboardPayload) {
+    // 阶段 9：暂停同步时不下发到本机剪贴板（与上行暂停对称）
+    if state.inner.lock().map(|g| g.paused).unwrap_or(false) {
+        return;
+    }
     let hash = payload.content_hash.clone();
     {
         let mut g = match state.inner.lock() {

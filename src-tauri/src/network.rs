@@ -62,6 +62,8 @@ impl StatusSink for TauriStatusSink {
             }
         }
         let _ = self.app.emit(STATUS_EVENT, ev);
+        // 阶段 9：连接/状态变化同步刷新托盘菜单“当前状态”项
+        crate::tray::sync_from_state(&self.app);
     }
 }
 
@@ -72,16 +74,19 @@ pub struct ManagerConfig {
     pub heartbeat_secs: u64,
     pub handshake_timeout: Duration,
     pub connect_timeout: Duration,
+    /// 自动重连：非用户断开后按保存的对方 IP 退避重连（阶段 8）
+    pub reconnect: bool,
 }
 
 impl ManagerConfig {
-    /// 生产参数：心跳 10 秒、握手 5 秒、连接 5 秒（与开发文档一致）。
+    /// 生产参数：心跳 10 秒、握手 5 秒、连接 5 秒、自动重连开（与开发文档一致）。
     pub fn production(port: u16) -> Self {
         Self {
             port,
             heartbeat_secs: 10,
             handshake_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
+            reconnect: true,
         }
     }
 }
@@ -133,17 +138,53 @@ impl HeartbeatState {
     }
 }
 
+/// 重连退避状态：成功连接后重置。
+struct ReconnectState {
+    cancel: CancellationToken,
+    attempts: u32,
+}
+
+impl Default for ReconnectState {
+    fn default() -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            attempts: 0,
+        }
+    }
+}
+
+/// 重连退避间隔（秒）：2 → 5 → 10 → 20 → 30 → 30 → ...
+const RECONNECT_BACKOFF: &[u64] = &[2, 5, 10, 20, 30];
+
+/// 退避间隔（毫秒）：基础序列 + 按 device_id 固定的抖动（0~1500ms）。
+/// 双方同时断线时若退避完全同步，会持续在同一时刻互相占用槽位而打结；
+/// 抖动随 device_id 固定，两台设备必然错峰重试，保证收敛。
+fn reconnect_delay_ms(device_id: &str, attempt: u32) -> u64 {
+    let idx = (attempt as usize).min(RECONNECT_BACKOFF.len() - 1);
+    let jitter_ms = device_id
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+        % 1500;
+    RECONNECT_BACKOFF[idx] * 1000 + jitter_ms
+}
+
 struct NetCore {
     device_id: String,
     device_name: String,
     cfg: ManagerConfig,
+    /// 阶段 8：自动重连开关（可变，运行时从 AppConfig 同步）
+    reconnect_enabled: AtomicBool,
     sink: Arc<dyn StatusSink>,
     zt_provider: Mutex<Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>>,
+    /// 阶段 8：当前"已保存的对方 IP"读取器（自动重连目标；lib.rs 注入，从 AppState 读取）
+    peer_ip_provider: Mutex<Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>>,
     /// 阶段 7：远程剪贴板落地回调（lib.rs 注入，负责写系统剪贴板 + 更新状态）
     clipboard_landing: Mutex<Option<Arc<dyn Fn(&protocol::ClipboardPayload) + Send + Sync>>>,
     /// 阶段 7：最近已处理的消息 ID（去重），上限 MAX_RECENT_MESSAGE_IDS
     recent_message_ids: Mutex<VecDeque<String>>,
     inner: Mutex<NetInner>,
+    /// 阶段 8：自动重连状态（用户主动断开时清除）
+    reconnect: Mutex<ReconnectState>,
 }
 
 #[derive(Default)]
@@ -214,12 +255,15 @@ impl NetworkManager {
             core: Arc::new(NetCore {
                 device_id,
                 device_name,
+                reconnect_enabled: AtomicBool::new(cfg.reconnect),
                 cfg,
                 sink,
                 zt_provider: Mutex::new(None),
+                peer_ip_provider: Mutex::new(None),
                 clipboard_landing: Mutex::new(None),
                 recent_message_ids: Mutex::new(VecDeque::new()),
                 inner: Mutex::new(NetInner::default()),
+                reconnect: Mutex::new(ReconnectState::default()),
             }),
         }
     }
@@ -227,6 +271,27 @@ impl NetworkManager {
     /// 注入本机 ZeroTier IP 读取器（打破 AppState 与 manager 的循环依赖，lib.rs 中设置）。
     pub fn set_zt_provider(&self, p: Arc<dyn Fn() -> Option<String> + Send + Sync>) {
         *self.core.zt_provider.lock().unwrap() = Some(p);
+    }
+
+    /// 阶段 8：配置自动重连开关（来自 AppConfig.auto_reconnect）。
+    pub fn set_reconnect(&self, enabled: bool) {
+        self.core
+            .reconnect_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// 注入"已保存的对方 IP"读取器（自动重连目标，阶段 8）。断线后由重连任务读取最新值。
+    pub fn set_peer_ip_provider(&self, p: Arc<dyn Fn() -> Option<String> + Send + Sync>) {
+        *self.core.peer_ip_provider.lock().unwrap() = Some(p);
+    }
+
+    fn peer_ip_now(&self) -> Option<String> {
+        self.core
+            .peer_ip_provider
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|p| p())
     }
 
     /// 注入远程剪贴板落地回调（阶段 7）：收到合法 clipboard_update 时调用，
@@ -421,7 +486,9 @@ impl NetworkManager {
     }
 
     /// 主动连接：校验由 commands 层完成；这里只做槽位保护 + 5 秒超时 TCP 连接 + 握手。
+    /// 用户主动连接会取消未完成的重连任务（与重连共用单一槽位）。
     pub async fn connect(&self, peer_ip: &str, port: u16) -> Result<(), AppError> {
+        self.cancel_reconnect();
         let conn = self.claim_conn()?;
         let gen = conn.generation;
         self.emit_if_current(&ConnectionStatusEvent {
@@ -443,6 +510,7 @@ impl NetworkManager {
     /// 用户主动断开：尽量发送 disconnect，取消全部任务并回到 Offline。
     /// 不自动重连；不清理配置中的 last_peer_ip。
     pub async fn disconnect(&self) {
+        self.cancel_reconnect();
         let conn = {
             let g = self.core.inner.lock().unwrap();
             g.conn.as_ref().map(|s| s.conn.clone())
@@ -466,8 +534,75 @@ impl NetworkManager {
         self.finalize(conn, CloseCause::User);
     }
 
+    /// 取消未完成的重连任务、重置退避计数（用户主动连接/断开、应用退出时调用）。
+    pub fn cancel_reconnect(&self) {
+        let mut rs = self.core.reconnect.lock().unwrap();
+        rs.cancel.cancel();
+        rs.attempts = 0;
+        // 默认 token 已取消不可复用；下次 start_reconnect 会替换为新 token。
+    }
+
+    /// 开始一次自动重连：读取当前保存的对方 IP，按退避间隔派发重连任务。
+    /// 返回 true 表示已调度；否则（重连未开启 / 无对方 IP）返回 false。
+    /// 每轮尝试失败（连接任务 finalize 触发）会再次进入本方法，退避间隔逐级递增；
+    /// 成功后 drive() 中重置计数（attempts=0），下次断线从头退避。
+    fn start_reconnect(&self) -> bool {
+        if !self.core.reconnect_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(peer) = self.peer_ip_now() else {
+            tracing::debug!("自动重连：未保存对方 IP，跳过");
+            return false;
+        };
+        let (delay_secs, cancel, attempt) = {
+            let mut rs = self.core.reconnect.lock().unwrap();
+            rs.cancel.cancel();
+            rs.cancel = CancellationToken::new();
+            let attempt = rs.attempts;
+            let d = reconnect_delay_ms(&self.core.device_id, attempt);
+            rs.attempts += 1;
+            (d, rs.cancel.clone(), attempt)
+        };
+        let m = self.clone();
+        let port = self.core.cfg.port;
+        tracing::info!(peer = %peer, delay_ms = delay_secs, attempt, "自动重连已调度");
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = time::sleep(Duration::from_millis(delay_secs)) => {
+                    m.reconnect_attempt(peer, port).await;
+                }
+            }
+        });
+        true
+    }
+
+    async fn reconnect_attempt(&self, peer: String, port: u16) {
+        // 已有活动连接（用户已连接 / 对端已连入）时跳过本轮，不再安排下一轮
+        if self.is_busy() {
+            tracing::debug!(peer = %peer, "自动重连：已有活动连接，停止本轮");
+            return;
+        }
+        tracing::info!(peer = %peer, "自动重连：开始尝试建立连接");
+        if let Err(e) = self.connect(&peer, port).await {
+            tracing::warn!(peer = %peer, %e, "自动重连启动失败（槽位/编码）");
+            // 未进入连接任务（无 finalize 触发下一轮），保持“重试中”并手动安排下一轮
+            self.emit(&ConnectionStatusEvent {
+                status: ConnectionStatus::Reconnecting,
+                status_text: crate::zerotier::STATUS_RECONNECTING.to_string(),
+                error_code: None,
+                peer: None,
+                generation: 0,
+            });
+            self.start_reconnect();
+        }
+        // connect 成功时连接任务在后台进行；成功/失败分别经 drive 的
+        // “重置 attempts” / “finalize → start_reconnect” 路径继续。
+    }
+
     /// 停止 listener 与活动连接（测试收尾/应用退出）。
     pub async fn shutdown(&self) {
+        self.cancel_reconnect();
         {
             let g = self.core.inner.lock().unwrap();
             if let Some(l) = &g.listener {
@@ -596,13 +731,20 @@ impl NetworkManager {
             peer_ip = %peer_ip,
             "hello 交换完成，连接已建立"
         );
+
+        // 阶段 8：双方同时主动连接时的冲突收敛。
+        // 单槽位设计下，双方各自 connect() 会先占住槽位，因此对方的入站必然在
+        // accept_loop 的 busy 分支被拒绝，握手无法完成，无需在 drive 内按 device_id 判定；
+        // 两侧会在各自退避一轮后由一方重连成功、另一方以入站方式接入，最终仍只保留一条通道。
         self.emit_if_current(&ConnectionStatusEvent {
             status: ConnectionStatus::Connected,
-            status_text: "已连接，剪贴板同步已开启。".into(),
+            status_text: crate::zerotier::STATUS_CONNECTED.to_string(),
             error_code: None,
             peer: Some(peer),
             generation: conn.generation,
         });
+        // 阶段 8：连接成功，重连退避计数从头开始（下次断线从 2 秒退避起算）。
+        self.core.reconnect.lock().unwrap().attempts = 0;
 
         let hb_secs = self.core.cfg.heartbeat_secs;
         let device_id = self.core.device_id.clone();
@@ -649,6 +791,7 @@ impl NetworkManager {
 
     /// hello 握手：出站先发送再读取；入站先读取再发送。
     /// 版本不兼容时回最小 error 消息后关闭；hello 超时（与连接阶段一致的超时）判 HandshakeTimeout。
+    /// 返回 (对方摘要, 对方 device_id)——device_id 供同时连接冲突判定（阶段 8），不进前端。
     async fn handshake(
         &self,
         conn: &Arc<Conn>,
@@ -875,6 +1018,20 @@ impl NetworkManager {
             tracing::debug!(gen, "旧连接结束，忽略其状态事件");
             return;
         }
+
+        // 阶段 8：非用户断开且已保存对方 IP 时进入自动重连，界面直接呈现“正在重试”。
+        if !matches!(&cause, CloseCause::User) && self.start_reconnect() {
+            tracing::info!(gen, "连接结束，进入自动重连");
+            self.emit(&ConnectionStatusEvent {
+                status: ConnectionStatus::Reconnecting,
+                status_text: crate::zerotier::STATUS_RECONNECTING.to_string(),
+                error_code: None,
+                peer: None,
+                generation: gen,
+            });
+            return;
+        }
+
         let (status, text, code) = self.terminal(&cause);
         tracing::info!(gen, ?status, code = ?code, "连接结束");
         self.emit(&ConnectionStatusEvent {
@@ -987,6 +1144,7 @@ mod tests {
                 heartbeat_secs: 1,
                 handshake_timeout: Duration::from_millis(300),
                 connect_timeout: Duration::from_millis(300),
+                reconnect: false,
             },
             sink.clone(),
         );
@@ -1121,5 +1279,43 @@ mod tests {
         // 生产端口固定 45888
         assert_eq!(ManagerConfig::production(45888).port, 45888);
         assert_eq!(crate::config::DEFAULT_LISTEN_PORT, 45888);
+    }
+
+    // 阶段 8：退避序列 2→5→10→20→30→30…，且抖动落在 [0,1500ms) 区间内
+    #[test]
+    fn reconnect_backoff_sequence_and_jitter() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        let expected_bases = [2000u64, 5000, 10000, 20000, 30000, 30000];
+        for (attempt, base) in expected_bases.iter().enumerate() {
+            let d = reconnect_delay_ms(id, attempt as u32);
+            let limit = base + 1500;
+            assert!(
+                d >= *base && d < limit,
+                "attempt {attempt}: {d} 应落在 [{base}, {limit})"
+            );
+        }
+        // 抖动随 device_id 固定：两台设备在相同 attempt 下错峰重试
+        assert_ne!(
+            reconnect_delay_ms("550e8400-550e-41d4-a716-446655440000", 0),
+            reconnect_delay_ms("6ba7b810-9dad-11d1-80b4-00c04fd430c8", 0)
+        );
+    }
+
+    // 阶段 8：自动重连开关 —— 关闭时不调度；开启且有对方 IP 时调度并随次数递增退避
+    #[tokio::test]
+    async fn reconnect_toggled_by_set_reconnect() {
+        let (m, _sink) = test_manager();
+        let peer = "192.168.191.181".to_string();
+        m.set_peer_ip_provider(Arc::new(move || Some(peer.clone())));
+        m.set_reconnect(false);
+        assert!(!m.start_reconnect(), "重连关闭时应返回 false");
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0, "不调度不递增");
+
+        m.set_reconnect(true);
+        assert!(m.start_reconnect(), "重连开启且有对方 IP 时应调度");
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 1);
+        // 用户主动断开会取消未完成的重连任务并重置计数
+        m.cancel_reconnect();
+        assert_eq!(m.core.reconnect.lock().unwrap().attempts, 0);
     }
 }

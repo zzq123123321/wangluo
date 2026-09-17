@@ -20,6 +20,9 @@ pub struct AppConfig {
     pub listen_port: u16,
     #[serde(default)]
     pub autostart: bool,
+    /// 阶段 8：断线后按保存的对方 IP 自动重连。旧配置缺省视为开启。
+    #[serde(default = "default_true")]
+    pub auto_reconnect: bool,
     #[serde(default)]
     pub sync_paused: bool,
     #[serde(default)]
@@ -31,6 +34,10 @@ fn default_listen_port() -> u16 {
     DEFAULT_LISTEN_PORT
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl AppConfig {
     /// 默认配置 + 新本机身份（首次启动或损坏恢复时使用）。
     pub fn new() -> Self {
@@ -38,6 +45,7 @@ impl AppConfig {
             schema_version: SCHEMA_VERSION,
             listen_port: DEFAULT_LISTEN_PORT,
             autostart: false,
+            auto_reconnect: true,
             sync_paused: false,
             last_peer_ip: None,
             identity: identity::new_identity(),
@@ -266,6 +274,7 @@ mod tests {
         assert_eq!(c.listen_port, 45888);
         assert_eq!(c.schema_version, 1);
         assert!(!c.autostart);
+        assert!(c.auto_reconnect);
         assert!(!c.sync_paused);
         assert!(c.last_peer_ip.is_none());
     }
@@ -398,19 +407,27 @@ mod tests {
         }
     }
 
-    // 缺失可默认字段时按既定兼容策略加载（listen_port 回默认 45888，其余回 null/false）
+    // 缺失可默认字段时按既定兼容策略加载（listen_port 回默认 45888，其余回 null/false；
+    // auto_reconnect 旧配置视为开启）
     #[test]
     fn missing_optional_fields_get_defaults() {
         let dir = tmp_dir();
         let cfg = AppConfig::new();
         let mut v = serde_json::to_value(&cfg).unwrap();
-        for k in ["listen_port", "autostart", "sync_paused", "last_peer_ip"] {
+        for k in [
+            "listen_port",
+            "autostart",
+            "auto_reconnect",
+            "sync_paused",
+            "last_peer_ip",
+        ] {
             v.as_object_mut().unwrap().remove(k);
         }
         std::fs::write(dir.join(CONFIG_FILE), serde_json::to_string(&v).unwrap()).unwrap();
         let loaded = ConfigStore::new(dir).load().unwrap();
         assert_eq!(loaded.listen_port, 45888);
         assert!(!loaded.autostart);
+        assert!(loaded.auto_reconnect);
         assert!(!loaded.sync_paused);
         assert!(loaded.last_peer_ip.is_none());
     }

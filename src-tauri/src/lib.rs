@@ -1,3 +1,4 @@
+mod autostart;
 mod clipboard;
 mod commands;
 pub mod config;
@@ -24,6 +25,13 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // 阶段 9：关闭窗口只隐藏到托盘，进程与同步继续；退出只能走托盘“退出 ClipLink”。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .setup(|app| {
             // 阶段 4：配置与本机身份必须先于依赖配置的后台任务就绪。
             // 初始化失败时 setup 返回 Err，进程带清晰错误退出，不带着未初始化身份继续运行。
@@ -37,6 +45,8 @@ pub fn run() {
             let cfg = store
                 .load()
                 .map_err(|e| Box::<dyn std::error::Error>::from(format!("配置初始化失败: {e}")))?;
+            // 阶段 9：cfg 随后移入 AppState，先取出启动时需要的开机启动偏好
+            let startup_autostart = cfg.autostart;
             // 日志只记录非敏感信息：目录、device_id、device_name；device_secret/shared_key 不得出现
             tracing::info!(
                 dir = %data_dir.display(),
@@ -58,6 +68,19 @@ pub fn run() {
             net.set_zt_provider(Arc::new(move || {
                 state_ref.inner.lock().ok()?.zerotier_ip.clone()
             }));
+            // 阶段 8：自动重连开关 + 重连目标（保存的对方 IP）从配置/AppState 注入。
+            let reconnect_enabled = {
+                let c = state
+                    .config
+                    .lock()
+                    .map_err(|_| Box::<dyn std::error::Error>::from("状态锁被污染"))?;
+                c.auto_reconnect
+            };
+            net.set_reconnect(reconnect_enabled);
+            let state_for_reconnect = state.clone();
+            net.set_peer_ip_provider(Arc::new(move || {
+                state_for_reconnect.inner.lock().ok()?.last_peer_ip.clone()
+            }));
             // 阶段 7：远程剪贴板落地回调（写系统剪贴板 + 更新状态 + 前端同步事件）
             let state_for_landing = state.clone();
             let app_for_landing = app.handle().clone();
@@ -66,6 +89,24 @@ pub fn run() {
             }));
             let state_for_clipboard = state.clone();
             app.manage(state);
+
+            // 阶段 9：系统托盘（依赖已管理的 AppState 读取初始状态）。
+            // TrayHandle 由 app.manage 持有到进程退出，防止托盘图标被 Drop 移除。
+            let tray = tray::setup(app.handle())?;
+            app.manage(tray);
+
+            // 阶段 9：开机启动的静默到托盘（注册表启动项携带 --minimized）。
+            // 顺带做一次注册表与配置的一致性修复：配置开启但注册项缺失时（如被手动删除）补写。
+            if std::env::args().any(|a| a == "--minimized") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+            if startup_autostart {
+                if let Err(e) = autostart::apply(true) {
+                    tracing::warn!(%e, "开机启动注册项修复失败");
+                }
+            }
 
             // 阶段 6：剪贴板监听（每 300ms 读一次纯文字，检测变化）
             clipboard::start(state_for_clipboard, app.handle().clone());

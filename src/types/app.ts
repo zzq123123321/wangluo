@@ -17,6 +17,7 @@ export interface AppSnapshot {
   app_version: string;
   listen_port: number;
   autostart: boolean;
+  auto_reconnect: boolean;
   last_peer_ip: string | null;
   zerotier_ip: string | null;
   zerotier_hint: string;
@@ -32,6 +33,7 @@ export interface AppSnapshot {
 export interface SettingsUpdate {
   autostart?: boolean;
   syncPaused?: boolean;
+  autoReconnect?: boolean;
   lastPeerIp?: string;
 }
 
