@@ -47,6 +47,26 @@
   - 新增 5 个单元测试（bind 失败后同 IP 重试、同 IP 幂等不重复、IP 变化安全重绑、已有连接时
     重连任务停止、connect 抢槽竞争不排不覆盖），8 个原生命周期测试全部保留。
   - 提交：`fix: harden reconnect and listener convergence`（已推送 origin/main）。
+- T11-06 PASS：剪贴板同步、防循环、暂停语义静态审查 + 修复。
+  - **发现并修复：暂停期间复制的内容恢复后被当作本地变化补发**——worker 暂停时跳过读取，
+    `last_clipboard_hash` 停在暂停前，恢复后首轮读到暂停期内复制的 B 被分类为 LocalChange
+    直接发送，违反"暂停期间不补发、恢复后只处理新复制"。修复：worker 维护 `was_paused`
+    运行期标志；发现暂停置位并跳过；恢复后的首个成功读数轮经 `apply_observation(resume_first)`
+    把当前剪贴板只吸收为本地基线（更新 hash/text、必要时消耗匹配的 remote marker）、绝不发送；
+    空/超限/读失败轮不消耗标志（空、超 1 MiB 也不作基线），之后的新复制走正常 LocalChange→Send。
+  - **发现并修复：远程剪贴板写失败遗留 `last_remote_hash`**——原 land_remote 先设置 remote
+    marker 再写剪贴板，写失败直接 return，marker 残留；用户以后本地复制相同 hash 内容会被误判
+    RemoteEcho 而永不发送。修复：抽 `clear_remote_marker_if_matches`，写失败/暂停中止时条件清理
+    marker（只清仍等于本次 hash 的标记，并发写入的新 marker 不被误删）。
+  - **审查确认（无其余 bug）**：RemoteEcho 顺序保持"先 marker 后写剪贴板"，写成功路径同时更新
+    hash/text 并清 marker；暂停与远程落地竞态以"写入前二次复查 paused + 条件清理 marker"收口
+    （不做跨系统剪贴板 API 的长锁事务）；断线期间仍只观察最新状态、不入队、不按历史补发；
+    >1 MiB 大文本不发送、不入待发、不更新为已同步，行为不变。land_remote 的
+    暂停拒绝/哈希去重决策抽为纯函数 `land_decision`。
+  - 新增 5 个单元测试（恢复首轮作基线不发送、恢复后新复制正常发送、写失败 marker 条件清理、
+    远端回显在状态应用层防循环、暂停/去重 land_decision），退化测试 0；真实双机剪贴板同步
+    未在本轮双机实测（保持阶段 5/7 手工清单）。
+  - 提交：`fix: harden clipboard pause and echo handling`（已推送 origin/main）。
 
 ## 环境事实（2026-09-16 核验）
 
@@ -295,5 +315,5 @@
 
 ## 下一步（阶段 11：测试和发布）
 
-1. T11-05 双端同连收敛与 listener 生命周期审查/修复已完成（见上方 T11 进展）。
-2. 下一轮等待总指挥下发 T11-06。
+1. T11-06 剪贴板暂停/防循环语义审查与修复已完成（见上方 T11 进展）。
+2. 下一轮等待总指挥下发 T11-07。
