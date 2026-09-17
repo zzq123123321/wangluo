@@ -18,11 +18,16 @@ fn reg_command(enabled: bool, exe: &Path) -> Command {
     cmd.arg(if enabled { "add" } else { "delete" });
     cmd.arg(RUN_KEY).arg("/v").arg(RUN_VALUE);
     if enabled {
-        let data = format!("\"{}\" {ARG_MINIMIZED}", exe.display());
-        cmd.arg("/t").arg("REG_SZ").arg("/d").arg(data);
+        cmd.arg("/t").arg("REG_SZ").arg("/d").arg(enable_data(exe));
     }
     cmd.arg("/f");
     cmd
+}
+
+/// Run 键写入值："<exe>" --minimized。启用/修复始终使用"当前 exe 路径"，
+/// 因此便携迁移后旧注册表路径不会残留（无条件覆盖）——T11-07 交付 2D。
+fn enable_data(exe: &Path) -> String {
+    format!("\"{}\" {ARG_MINIMIZED}", exe.display())
 }
 
 /// 当前 Run 键下是否已存在 ClipLink 启动项。
@@ -34,11 +39,18 @@ fn value_exists() -> bool {
         .unwrap_or(false)
 }
 
-/// 应用开机启动状态：enabled=true 写入/刷新 Run 键；false 删除（目标本就不存在视为成功）。
+/// disable 是否仍需真删注册表：目标项已不存在时视为幂等成功（T11-07 交付 2B）。
+/// 纯决策 helper，便于单测：注册表项缺失绝不应导致配置无法回到 false。
+fn disable_is_noop(exists: bool) -> bool {
+    !exists
+}
+
+/// 应用开机启动状态：enabled=true 写入/刷新 Run 键（恒用当前 exe；
+/// 同时覆盖"项缺失需修复"与"旧路径需迁移"两种情况）；false 删除（目标本就不存在视为成功）。
 /// 只有 reg 执行失败才返回 Err；调用方据此决定是否更新配置，保证配置与注册表一致。
 pub fn apply(enabled: bool) -> Result<(), String> {
     let exe = current_exe()?;
-    if !enabled && !value_exists() {
+    if disable_is_noop(value_exists()) && !enabled {
         return Ok(());
     }
     let out = reg_command(enabled, &exe)
@@ -104,5 +116,42 @@ mod tests {
         assert_eq!(a[0], "query");
         assert!(a.contains(&RUN_KEY.to_string()));
         assert!(a.contains(&RUN_VALUE.to_string()));
+    }
+
+    // T11-07 测试 2：关闭开机启动幂等——Run 项本就不存在时 disable 视为成功，
+    // 配置必须能无碍回落到 false，不能被"项已不存在"卡死。
+    #[test]
+    fn disable_when_entry_missing_is_idempotent_ok() {
+        assert!(
+            disable_is_noop(false),
+            "项不存在：disable 无需执行任何 reg 命令"
+        );
+        assert!(
+            !disable_is_noop(true),
+            "项存在：disable 需要执行 reg delete"
+        );
+    }
+
+    // T11-07 测试 3：便携迁移——启用/修复恒用"当前 exe 路径"构造 Run 值，
+    // Run 键中若残留旧路径（用户移动了程序目录）会被无条件覆盖为当前路径。
+    #[test]
+    fn portable_move_rewrites_old_exe_path() {
+        let old_exe = Path::new(r"D:\Old\ClipLink\cliplink.exe");
+        let new_exe = Path::new(r"E:\New Folder\ClipLink\cliplink.exe");
+        // 旧路径下构造的启动命令行指向旧位置（不代表会残留，仅验证新写入覆盖旧值）
+        let old_data = enable_data(old_exe);
+        assert!(old_data.contains("D:\\Old\\ClipLink"));
+        // 以“当前 exe”重新 enable：reg add /f 无条件覆盖，旧路径不再出现
+        let a = args_of(&reg_command(true, new_exe));
+        let data = a[a.len() - 2].clone();
+        assert!(
+            data.contains(r"E:\New Folder\ClipLink\cliplink.exe"),
+            "部署新路径应写入 Run 值"
+        );
+        assert!(
+            !data.contains("D:\\Old\\ClipLink"),
+            "旧启动路径不得残留于新写入"
+        );
+        assert!(data.ends_with(" --minimized"));
     }
 }

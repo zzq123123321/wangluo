@@ -67,6 +67,35 @@
     远端回显在状态应用层防循环、暂停/去重 land_decision），退化测试 0；真实双机剪贴板同步
     未在本轮双机实测（保持阶段 5/7 手工清单）。
   - 提交：`fix: harden clipboard pause and echo handling`（已推送 origin/main）。
+- T11-07 PASS：托盘/开机启动/窗口关闭/退出生命周期审查 + 修复。
+  - **发现并修复：托盘“退出 ClipLink”只 `app.exit(0)`，从不调用 `NetworkManager::shutdown()`**——
+    T11-04 的退出门槛（exiting）仅在 `shutdown()` 中置位，此前生产退出路径根本走不到，
+    后台连接/重连任务没有任何清理机会。修复：新增 `tray::quit(app)`——先经
+    `tauri::async_runtime::spawn` 调 `net.shutdown()`（2 秒超时保护，锁异常/超时都不阻碍退出），
+    再 `app.exit(0)`；无 state 时保留安全兜底 `app.exit(0)`。仓库中 `app.exit` 仅剩此一处。
+  - **发现并修复：托盘“重新连接”在已连接时命中 `AlreadyConnected` 无操作**——原实现直接
+    `do_connect`，`claim_conn` 返回 Err(AlreadyConnected)，菜单语义断裂。修复：抽出
+    `reconnect_peer(state)`：无已保存 IP 则警告返回；`net.is_busy()` 时先 `disconnect().await`
+    （User 关闭，不触发自动重连）再 `do_connect` 重新占用单槽位，顺序 await、无重连 race。
+  - **审查确认（无 bug，不改）**：X 关闭=隐藏+prevent_close 且进程继续（含 indicator 关闭）；
+    托盘/呼吸灯 `show_main` 恢复主窗口（unminimize/show/focus + 隐藏 indicator + mark MainShown）；
+    `--minimized` 启动隐藏主窗、MainShown 不置位故不弹呼吸灯；最小化接管受 MainShown 门控；
+    托盘暂停/恢复经 `apply_user_settings` 与 AppState/前端/菜单三方一致；`sync_from_state` 稳定。
+  - **autostart 审查**：开启“先注册表后配置”正确；disable 幂等（Run 项缺失视为成功）；
+    启动修复无条件 `apply(true)` 恒用当前 exe 覆盖，天然覆盖“项缺失”与“旧路径迁移”（含便携移动），
+    无需额外迁移逻辑。重构抽出纯 helper `enable_data`/`disable_is_noop` 以补可测点。
+  - 新增 5 个单元测试（autostart：disable 幂等、便携移动覆盖旧路径；tray：已有连接时重新连接
+    先 Offline 再 Connecting 且无自动重连、无 IP 时空操作、退出路径 shutdown 清槽清监听且不再建连）；
+    共 **98 单元 + 11 集成 = 109/109 通过**，`cargo fmt --check`/`cargo check`/`npm run build`/
+    `git diff --check` 全绿。
+  - **真实运行冒烟（独立验证，非伪造点击）**：正常启动窗口可见；WM_CLOSE（等同点 X）后窗口隐藏、
+    进程存活；SC_MINIMIZE（等同最小化）后主窗隐藏、呼吸灯窗口出现；向真实隐藏托盘窗口
+    （`tray_icon_app`）投递 `WM_COMMAND`（等同点击菜单项）依次验证“打开主界面”（主窗恢复+聚焦）、
+    “暂停同步”/“恢复同步”（config 持久化 true→false）、“开机启动”开→关（Run 键写入
+    `"<exe>" --minimized` → 删除）；“退出 ClipLink”真实走通退出路径、进程消失；
+    `--minimized` 启动无主窗无呼吸灯；启动修复真实触发（配置开启 + Run 项指向旧 exe →
+    启动后重写为当前 exe）。验证后环境已还原（配置、Run 键、备份文件、进程全部清理）。
+  - 提交：`fix: harden tray and autostart lifecycle`（已推送 origin/main）。
 
 ## 环境事实（2026-09-16 核验）
 
@@ -315,5 +344,5 @@
 
 ## 下一步（阶段 11：测试和发布）
 
-1. T11-06 剪贴板暂停/防循环语义审查与修复已完成（见上方 T11 进展）。
-2. 下一轮等待总指挥下发 T11-07。
+1. T11-07 托盘/开机启动/窗口关闭/退出生命周期审查与修复已完成（见上方 T11 进展）。
+2. 下一轮等待总指挥下发 T11-08。

@@ -123,8 +123,26 @@ fn handle_menu(app: &AppHandle, event: tauri::menu::MenuEvent) {
         MENU_PAUSE => toggle_sync_paused(app),
         MENU_RECONNECT => reconnect(app),
         MENU_AUTOSTART => toggle_autostart(app),
-        MENU_QUIT => app.exit(0),
+        MENU_QUIT => quit(app),
         _ => {}
+    }
+}
+
+/// 真正退出：先停止网络生命周期（listener / 活动连接 / 自动重连），再退出进程。
+/// T11-04 的退出门槛（exiting）只会在 shutdown() 中置位——这里必须真实调用，
+/// 否则用户点击“退出 ClipLink”时后台连接/重连任务没有任何清理机会。
+/// 2 秒超时保护：shutdown 内部任务取消不阻塞 UI，锁异常/超时都不阻碍最终 exit。
+/// 仅此一处发起 exit，不重复调用。
+fn quit(app: &AppHandle) {
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        let net = state.net.clone();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), net.shutdown()).await;
+            app.exit(0);
+        });
+    } else {
+        app.exit(0);
     }
 }
 
@@ -196,16 +214,190 @@ fn apply_and_notify(app: &AppHandle, state: &AppState, settings: commands::Setti
     }
 }
 
+/// 托盘“重新连接”：按已保存的对方 IP 重连。若当前已有活动/建立中连接，
+/// 先 disconnect（取消自动重连并释放槽位）再 connect——满足“重新连接”语义，
+/// 避免在 Connected 状态下直接 connect 命中 AlreadyConnected 报错或制造并发连接。
+/// 断线与重连在同一任务内顺序 await，无自动重连 race（disconnect 为 User 关闭，
+/// 不会触发 start_reconnect；随后 do_connect 重新占用单一槽位）。
+pub(crate) async fn reconnect_peer(state: &AppState) {
+    let ip = state.inner.lock().ok().and_then(|g| g.last_peer_ip.clone());
+    let Some(ip) = ip else {
+        tracing::warn!("托盘重新连接：没有已保存的对方 IP");
+        return;
+    };
+    if state.net.is_busy() {
+        state.net.disconnect().await;
+    }
+    if let Err(e) = commands::do_connect(state, &ip).await {
+        tracing::warn!(%e, "托盘重新连接失败");
+    }
+}
+
 fn reconnect(app: &AppHandle) {
     let state = app.state::<Arc<AppState>>().inner().clone();
     tauri::async_runtime::spawn(async move {
-        let ip = state.inner.lock().ok().and_then(|g| g.last_peer_ip.clone());
-        let Some(ip) = ip else {
-            tracing::warn!("托盘重新连接：没有已保存的对方 IP");
-            return;
-        };
-        if let Err(e) = commands::do_connect(&state, &ip).await {
-            tracing::warn!(%e, "托盘重新连接失败");
-        }
+        reconnect_peer(&state).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconnect_peer;
+    use crate::config::ConfigStore;
+    use crate::network::{self, ConnectionStatusEvent};
+    use crate::state::{AppState, ConnectionStatus};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct VecSink(Mutex<Vec<ConnectionStatusEvent>>);
+
+    impl VecSink {
+        fn new() -> Self {
+            Self(Mutex::new(Vec::new()))
+        }
+        fn all(&self) -> Vec<ConnectionStatusEvent> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl network::StatusSink for VecSink {
+        fn on_status(&self, ev: &ConnectionStatusEvent) {
+            self.0.lock().unwrap().push(ev.clone());
+        }
+    }
+
+    fn test_state() -> (AppState, Arc<VecSink>) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("cliplink-test-tray-{}-{ts}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(ConfigStore::new(dir));
+        let cfg = store.load().unwrap();
+        let sink = Arc::new(VecSink::new());
+        let net = Arc::new(network::NetworkManager::new(
+            cfg.identity.device_id.clone(),
+            cfg.identity.device_name.clone(),
+            network::ManagerConfig {
+                port: 0,
+                heartbeat_secs: 1,
+                handshake_timeout: Duration::from_millis(300),
+                connect_timeout: Duration::from_secs(5),
+                // 关闭自动重连：让本测试只验证“重新连接”语义，
+                // 排除后台自动重连对事件序列的干扰
+                reconnect: false,
+            },
+            sink.clone(),
+        ));
+        let state = AppState::new(store, cfg, net);
+        (state, sink)
+    }
+
+    // T11-07 测试 4：已有活动连接时点击“重新连接”——先断开旧连接（Offline），
+    // 再建立新连接（Connecting），不制造双连接、不触发自动重连、不覆盖为错误状态。
+    #[test]
+    fn tray_reconnect_with_active_conn_restarts_cleanly() {
+        let (state, sink) = test_state();
+        {
+            let mut g = state.inner.lock().unwrap();
+            g.zerotier_ip = Some("192.168.191.180".into());
+            g.last_peer_ip = Some("192.0.2.1".into());
+        }
+        // 先占满唯一槽位（模拟已有连接）
+        let _c1 = state.net.claim_conn().unwrap();
+        assert!(state.net.is_busy());
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            reconnect_peer(&state).await;
+        });
+
+        // 修复前：已连接时直接 do_connect 会命中 AlreadyConnected，不产生任何状态事件
+        // （旧连接保持 Connected，没有 Offline、没有 Connecting）。
+        // 修复后：先断开旧连接（Offline）再重连（Connecting），且全程无自动重连事件。
+        let statuses = sink
+            .all()
+            .into_iter()
+            .map(|e| (e.status, e.generation))
+            .collect::<Vec<_>>();
+        let offline_gen = statuses
+            .iter()
+            .find(|(s, _)| *s == ConnectionStatus::Offline)
+            .map(|(_, g)| *g);
+        assert!(
+            offline_gen.is_some(),
+            "重新连接应先断开旧连接，实际事件：{statuses:?}"
+        );
+        assert!(
+            statuses
+                .iter()
+                .any(|(s, _)| *s == ConnectionStatus::Connecting),
+            "重新连接后应进入 Connecting，实际事件：{statuses:?}"
+        );
+        assert!(
+            offline_gen.is_some_and(|g| statuses
+                .iter()
+                .any(|(s, gen)| *s == ConnectionStatus::Connecting && *gen > g)),
+            "新连接代次应大于旧连接代次，实际事件：{statuses:?}"
+        );
+        assert!(
+            !statuses
+                .iter()
+                .any(|(s, _)| *s == ConnectionStatus::Reconnecting),
+            "用户主动重新连接不得触发自动重连事件：{statuses:?}"
+        );
+    }
+
+    // 没有已保存的对方 IP 时，重新连接应安全返回（空操作、不误触发任何连接）。
+    #[test]
+    fn tray_reconnect_without_peer_ip_is_noop() {
+        let (state, sink) = test_state();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            reconnect_peer(&state).await;
+        });
+        assert!(!state.net.is_busy());
+        assert!(sink.all().is_empty(), "无目标 IP 时不得产生任何状态事件");
+    }
+
+    // T11-07 测试 4b：退出路径先调用 shutdown —— 之后不再安排/执行自动重连，
+    // 且 listener/连接槽位被清空（真实托盘退出路径的共享内部行为）。
+    #[test]
+    fn tray_quit_path_shuts_network_down_first() {
+        let (state, sink) = test_state();
+        {
+            let mut g = state.inner.lock().unwrap();
+            g.last_peer_ip = Some("192.0.2.1".into());
+        }
+        let _c1 = state.net.claim_conn().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            state.net.shutdown().await;
+        });
+        assert!(!state.net.is_busy(), "退出后连接槽位应清空");
+        assert!(
+            state.net.listener_local_addr().is_none(),
+            "退出后 listener 应释放"
+        );
+        // shutdown 后不得再发起任何连接（无 Connecting 事件）
+        assert!(
+            !sink
+                .all()
+                .iter()
+                .any(|e| e.status == ConnectionStatus::Connecting),
+            "退出后不得再发起连接"
+        );
+    }
 }
