@@ -117,6 +117,34 @@
   - 测试：**98 单元 + 18 集成 = 116/116 通过**（新增 6 集成，原 109 全部保留），
     `cargo fmt --check`/`cargo check`/`npm run build`/`git diff --check` 全绿。
   - 提交：`test: strengthen protocol failure coverage`（已推送 origin/main）。
+- T11-09 PASS：配置/AppState/快照一致性测试补强，未发现新的生产缺陷。
+  - **审查结论（以源码为准，均正确，无需修复）**：
+    - 旧配置兼容：`auto_reconnect` 经 serde `default_true` 缺省补 true；未知字段默认忽略，
+      加载不 panic、不丢其他字段。
+    - 损坏配置：JSON 解析失败/关键字段语义无效先备份 `config.json.bak-…`（永不复写旧备份）
+      再生成新默认配置+新身份原子保存，不 panic、原文件不静默删除。
+    - 保存原子性：同目录临时文件 写入+sync_all → Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`
+      替换（非"先删后 rename"，重试 PermissionDenied 5×10ms，失败清理临时文件）——已安全，不改。
+    - update_settings 顺序：校验 last_peer_ip → `store.save` → 更新内存 config/inner →
+      `set_reconnect`；save 失败在一切内存改动前返回，config/inner/磁盘/NetworkManager 均不变。
+    - autostart 先注册表后配置；注册表已变但配置保存失败的可接受残余由启动修复机制重新对齐。
+    - pause 只在 Connected↔Paused 间切换状态/文案，Offline/Reconnecting/Error 下仅改标志。
+    - last_peer_ip：空串清 None、None 不改、非法语法在 save 前拒绝（不碰磁盘/内存）；
+      SettingsUpdate 层只做 IPv4 语法校验，连接目标规则仍归 `validate_peer_target`。
+    - AppSnapshot 字段级无敏感字段；`device_secret` 不进入结构/事件/序列化。
+  - 新增 6 个单元测试（合计 0 生产改动）：`old_config_missing_auto_reconnect_preserves_other_fields`
+    （旧配置仅缺 auto_reconnect + 其余非默认字段保持）、
+    `save_failure_keeps_config_inner_disk_and_network_unchanged`（save Err 后 config/inner/磁盘全不变）、
+    `save_failure_does_not_toggle_network_manager_reconnect`（保存失败后 auto_reconnect 不提前同步到
+    NetworkManager——用收集型 sink 观察 finalize(Lost) 走 Reconnecting 分支而非 Error，不新增读取接口）、
+    `illegal_last_peer_ip_keeps_all_state`（999.999.1.1 / abc 拒绝且磁盘/config/inner 保持原值）、
+    `success_path_keeps_config_inner_snapshot_consistent`（成功路径 config/inner/快照三方一致）、
+    `pause_keeps_reconnecting_status_text`（Reconnecting 下暂停只改标志不改文案）。
+    另强化既有 2 个测试：清空 last_peer_ip 断言补 config/inner/磁盘三处 None；快照序列化补
+    `device_secret` 字段名不得出现断言。
+  - 测试：**104 单元 + 18 集成 = 122/122 通过**（新增 6 单元，原 116 全部保留），
+    `cargo fmt --check`/`cargo test -- --test-threads=1`/`cargo check`/`npm run build`/`git diff --check` 全绿。
+  - 提交：`test: strengthen settings state coverage`（已推送 origin/main）。
 
 ## 环境事实（2026-09-16 核验）
 

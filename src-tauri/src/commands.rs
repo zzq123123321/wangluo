@@ -339,6 +339,10 @@ mod tests {
         assert!(json.contains("SNAP-TEST"));
         assert!(json.contains(&cfg.identity.device_id));
         assert!(json.contains("10.147.17.36"));
+        assert!(
+            !json.contains("device_secret"),
+            "快照序列化结果不得出现 secret 字段名"
+        );
     }
 
     // update_settings：非法输入拒绝且内存不变；有效写入先落盘再更新内存；空字符串清除
@@ -384,7 +388,12 @@ mod tests {
         };
         let snap = apply_settings(&state, &clear).unwrap();
         assert!(snap.last_peer_ip.is_none());
-        assert!(state.store.config_path().exists());
+        assert!(state.config.lock().unwrap().last_peer_ip.is_none());
+        assert!(state.inner.lock().unwrap().last_peer_ip.is_none());
+        let disk: config::AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(state.store.config_path()).unwrap())
+                .unwrap();
+        assert!(disk.last_peer_ip.is_none());
     }
 
     // 身份摘要只含 device_id / device_name，序列化结果不含 secret
@@ -535,5 +544,195 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(state.store.config_path()).unwrap())
                 .unwrap();
         assert!(!disk.auto_reconnect);
+    }
+
+    // 保存失败（临时文件路径被目录占用）时：内存 config/inner/磁盘/NetworkManager
+    // 重连开关全部保持原值——save 之前绝不更新任何状态，auto_reconnect 不提前同步到管理器。
+    #[test]
+    fn save_failure_keeps_config_inner_disk_and_network_unchanged() {
+        let state = test_state();
+        let baseline = SettingsUpdate {
+            autostart: Some(true),
+            sync_paused: Some(true),
+            auto_reconnect: Some(true),
+            last_peer_ip: Some("10.147.17.36".into()),
+        };
+        apply_settings(&state, &baseline).unwrap();
+        std::fs::create_dir(state.store.config_path().with_file_name("config.json.tmp")).unwrap();
+        let fail = SettingsUpdate {
+            autostart: Some(false),
+            sync_paused: Some(false),
+            auto_reconnect: Some(false),
+            last_peer_ip: Some("10.9.9.9".into()),
+        };
+        assert!(apply_settings(&state, &fail).is_err());
+        let cfg = state.config.lock().unwrap();
+        assert!(cfg.autostart);
+        assert!(cfg.sync_paused);
+        assert!(cfg.auto_reconnect);
+        assert_eq!(cfg.last_peer_ip.as_deref(), Some("10.147.17.36"));
+        drop(cfg);
+        let g = state.inner.lock().unwrap();
+        assert!(g.paused);
+        assert_eq!(g.last_peer_ip.as_deref(), Some("10.147.17.36"));
+        drop(g);
+        let disk: config::AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(state.store.config_path()).unwrap())
+                .unwrap();
+        assert!(disk.autostart);
+        assert!(disk.sync_paused);
+        assert!(disk.auto_reconnect);
+        assert_eq!(disk.last_peer_ip.as_deref(), Some("10.147.17.36"));
+    }
+
+    // 保存失败时 auto_reconnect 不得提前同步到 NetworkManager：用收集型 sink 观察
+    // finalize(Lost) 后的状态事件——开关保持开启（未被打到 false）则走 Reconnecting 分支，
+    // 若 bug 在落盘前已 set_reconnect(false) 则 start_reconnect 返回 false、只会走到 Error。
+    #[test]
+    fn save_failure_does_not_toggle_network_manager_reconnect() {
+        struct ReconnectSink(std::sync::Mutex<Vec<network::ConnectionStatusEvent>>);
+        impl network::StatusSink for ReconnectSink {
+            fn on_status(&self, ev: &network::ConnectionStatusEvent) {
+                self.0.lock().unwrap().push(ev.clone());
+            }
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("cliplink-test-cmdrc-{}-{ts}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(ConfigStore::new(dir.clone()));
+        let cfg = store.load().unwrap();
+        let sink = Arc::new(ReconnectSink(std::sync::Mutex::new(Vec::new())));
+        let net = Arc::new(network::NetworkManager::new(
+            cfg.identity.device_id.clone(),
+            cfg.identity.device_name.clone(),
+            network::ManagerConfig::production(45888),
+            sink.clone(),
+        ));
+        net.set_peer_ip_provider(Arc::new(|| Some("10.0.0.5".to_string())));
+        let state = AppState::new(store, cfg, net.clone());
+        std::fs::create_dir(state.store.config_path().with_file_name("config.json.tmp")).unwrap();
+        let fail = SettingsUpdate {
+            autostart: None,
+            sync_paused: None,
+            auto_reconnect: Some(false),
+            last_peer_ip: None,
+        };
+        assert!(apply_settings(&state, &fail).is_err());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let conn = net.claim_conn().unwrap();
+            net.finalize(conn, network::CloseCause::Lost);
+        });
+        let last = sink.0.lock().unwrap().last().cloned();
+        assert_eq!(
+            last.map(|e| e.status),
+            Some(ConnectionStatus::Reconnecting),
+            "保存失败后重连开关应保持开启（否则最终状态事件会是 Error）"
+        );
+    }
+
+    // 非法 last_peer_ip：返回 Err，且磁盘/config/inner 全部保持已保存的正常值
+    #[test]
+    fn illegal_last_peer_ip_keeps_all_state() {
+        let state = test_state();
+        apply_settings(
+            &state,
+            &SettingsUpdate {
+                autostart: None,
+                sync_paused: None,
+                auto_reconnect: None,
+                last_peer_ip: Some("10.147.17.36".into()),
+            },
+        )
+        .unwrap();
+        for bad in ["999.999.1.1", "abc"] {
+            let r = apply_settings(
+                &state,
+                &SettingsUpdate {
+                    autostart: None,
+                    sync_paused: None,
+                    auto_reconnect: None,
+                    last_peer_ip: Some(bad.into()),
+                },
+            );
+            assert!(r.is_err(), "应拒绝 {bad:?}");
+            assert_eq!(
+                state.config.lock().unwrap().last_peer_ip.as_deref(),
+                Some("10.147.17.36")
+            );
+            assert_eq!(
+                state.inner.lock().unwrap().last_peer_ip.as_deref(),
+                Some("10.147.17.36")
+            );
+            let disk: config::AppConfig =
+                serde_json::from_str(&std::fs::read_to_string(state.store.config_path()).unwrap())
+                    .unwrap();
+            assert_eq!(disk.last_peer_ip.as_deref(), Some("10.147.17.36"));
+        }
+    }
+
+    // 暂停在 Reconnecting 状态只改 paused 标志，不改写既有状态与文案
+    // （Error 的不改写已有 pause_keeps_non_connected_status_text 覆盖）
+    #[test]
+    fn pause_keeps_reconnecting_status_text() {
+        let state = test_state();
+        {
+            let mut g = state.inner.lock().unwrap();
+            g.status = ConnectionStatus::Reconnecting;
+            g.status_text = crate::zerotier::STATUS_RECONNECTING.into();
+        }
+        let snap = apply_settings(
+            &state,
+            &SettingsUpdate {
+                autostart: None,
+                sync_paused: Some(true),
+                auto_reconnect: None,
+                last_peer_ip: None,
+            },
+        )
+        .unwrap();
+        assert!(snap.paused);
+        assert_eq!(snap.status, ConnectionStatus::Reconnecting);
+        assert_eq!(snap.status_text, crate::zerotier::STATUS_RECONNECTING);
+    }
+
+    // 成功路径：config / inner / 返回快照三方一致，且磁盘已同步（快照与来源状态一致）
+    #[test]
+    fn success_path_keeps_config_inner_snapshot_consistent() {
+        let state = test_state();
+        let snap = apply_settings(
+            &state,
+            &SettingsUpdate {
+                autostart: Some(true),
+                sync_paused: Some(true),
+                auto_reconnect: Some(false),
+                last_peer_ip: Some("10.1.2.3".into()),
+            },
+        )
+        .unwrap();
+        let cfg = state.config.lock().unwrap();
+        let g = state.inner.lock().unwrap();
+        assert_eq!(snap.autostart, cfg.autostart);
+        assert_eq!(snap.auto_reconnect, cfg.auto_reconnect);
+        assert_eq!(snap.paused, g.paused);
+        assert_eq!(snap.last_peer_ip, g.last_peer_ip);
+        assert_eq!(snap.last_peer_ip, cfg.last_peer_ip);
+        assert_eq!(g.last_peer_ip.as_deref(), Some("10.1.2.3"));
+        drop(cfg);
+        drop(g);
+        let disk: config::AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(state.store.config_path()).unwrap())
+                .unwrap();
+        assert!(disk.autostart);
+        assert!(disk.sync_paused);
+        assert!(!disk.auto_reconnect);
+        assert_eq!(disk.last_peer_ip.as_deref(), Some("10.1.2.3"));
     }
 }

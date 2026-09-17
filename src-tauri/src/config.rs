@@ -407,6 +407,28 @@ mod tests {
         }
     }
 
+    // 旧配置仅缺 auto_reconnect（例如阶段 7 之前的 config.json）：加载成功、回默认 true，
+    // 其余非默认字段（端口/autostart/sync_paused/last_peer_ip/identity）全部保持不变
+    #[test]
+    fn old_config_missing_auto_reconnect_preserves_other_fields() {
+        let dir = tmp_dir();
+        let cfg = AppConfig::new();
+        let mut v = serde_json::to_value(&cfg).unwrap();
+        v["listen_port"] = serde_json::Value::from(45889u16);
+        v["autostart"] = serde_json::Value::Bool(true);
+        v["sync_paused"] = serde_json::Value::Bool(true);
+        v["last_peer_ip"] = serde_json::Value::String("10.1.2.3".into());
+        v.as_object_mut().unwrap().remove("auto_reconnect");
+        std::fs::write(dir.join(CONFIG_FILE), serde_json::to_string(&v).unwrap()).unwrap();
+        let loaded = ConfigStore::new(dir).load().unwrap();
+        assert!(loaded.auto_reconnect, "旧配置缺 auto_reconnect 应默认开启");
+        assert_eq!(loaded.listen_port, 45889);
+        assert!(loaded.autostart);
+        assert!(loaded.sync_paused);
+        assert_eq!(loaded.last_peer_ip.as_deref(), Some("10.1.2.3"));
+        assert_eq!(loaded.identity.device_id, cfg.identity.device_id);
+    }
+
     // 缺失可默认字段时按既定兼容策略加载（listen_port 回默认 45888，其余回 null/false；
     // auto_reconnect 旧配置视为开启）
     #[test]
