@@ -5,6 +5,7 @@
 // 连接状态变化（TauriStatusSink）与托盘内设置切换都会调用 sync_from_state 刷新菜单项。
 use crate::commands;
 use crate::state::AppState;
+use crate::MainShown;
 use std::sync::Arc;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -149,6 +150,11 @@ pub(crate) fn show_main(app: &AppHandle) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+        // T11-03B-FIX1：恢复主窗口即视为“已正式展示”，此后用户最小化
+        // 才触发呼吸灯接管（--minimized 启动也由这条路解锁）。
+        if let Some(gate) = app.try_state::<Arc<MainShown>>() {
+            gate.mark();
+        }
     }
     if let Some(ind) = app.get_webview_window("indicator") {
         let _ = ind.hide();

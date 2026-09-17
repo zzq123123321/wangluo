@@ -11,8 +11,26 @@ mod tray;
 pub mod zerotier;
 
 use state::AppState;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::Manager;
+
+/// T11-03B-FIX1：主窗口“已正式展示”的运行期门槛。
+/// 仅当置位后，最小化接管（隐藏主窗口 + 显示呼吸灯）才生效。启动阶段
+/// Windows/Tauri/WebView2 的布局瞬态可能让 Resized 期间 is_minimized 短暂
+/// 报真，若只看 is_minimized 会把正常启动误判成用户主动最小化。
+/// 置位途径：正常启动后的一次性延后确认；托盘/呼吸灯 show_main 恢复主窗口。
+#[derive(Default)]
+pub(crate) struct MainShown(AtomicBool);
+
+impl MainShown {
+    pub(crate) fn mark(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    pub(crate) fn is_shown(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -35,7 +53,15 @@ pub fn run() {
                 }
                 tauri::WindowEvent::Resized(_) => {
                     // Windows 最小化会触发 Resized 且 is_minimized 为真，据此拦截接管。
-                    if window.label() == "main" && window.is_minimized().unwrap_or(false) {
+                    // 但仅当主窗口已“正式展示”过（MainShown 就绪）才生效：
+                    // 启动瞬间的 minized 瞬态不得被当成用户主动最小化（T11-03B-FIX1）。
+                    let Some(gate) = window.app_handle().try_state::<Arc<MainShown>>() else {
+                        return;
+                    };
+                    if gate.is_shown()
+                        && window.label() == "main"
+                        && window.is_minimized().unwrap_or(false)
+                    {
                         tracing::debug!("主窗口最小化：隐藏并显示状态呼吸灯");
                         let _ = window.hide();
                         if let Some(ind) = window.app_handle().get_webview_window("indicator") {
@@ -109,6 +135,10 @@ pub fn run() {
             let tray = tray::setup(app.handle())?;
             app.manage(tray);
 
+            // T11-03B-FIX1：“已正式展示”门槛状态——最小化接管只在就绪后生效。
+            let shown = Arc::new(MainShown::default());
+            app.manage(shown);
+
             // T11-03B：状态呼吸灯窗口——极小的无边框透明浮窗，始终置顶、不进任务栏。
             // 默认隐藏：只有用户主动最小化主窗口才显示（--minimized 静默启动不弹呼吸灯）。
             let indicator =
@@ -156,6 +186,28 @@ pub fn run() {
                 if let Err(e) = autostart::apply(true) {
                     tracing::warn!(%e, "开机启动注册项修复失败");
                 }
+            }
+
+            // T11-03B-FIX1：一次性延迟确认——主窗口已正常可见且非最小化，
+            // 才标记“已正式展示”，此后用户最小化才触发呼吸灯接管。
+            // --minimized 启动时主窗口保持隐藏，这里永远不会置位（也不占呼吸灯），
+            // 直到用户经托盘 show_main 恢复主窗口时才解锁。
+            {
+                let gate = app.state::<Arc<MainShown>>().inner().clone();
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let ready = handle
+                        .get_webview_window("main")
+                        .map(|w| {
+                            w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if ready {
+                        gate.mark();
+                        tracing::debug!("主窗口已正式展示，最小化接管就绪");
+                    }
+                });
             }
 
             // 阶段 6：剪贴板监听（每 300ms 读一次纯文字，检测变化）
