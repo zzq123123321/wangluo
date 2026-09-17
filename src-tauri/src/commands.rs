@@ -277,6 +277,13 @@ pub async fn disconnect_peer(state: State<'_, Arc<AppState>>) -> Result<(), AppE
     do_disconnect(&state).await
 }
 
+/// T11-03B：状态呼吸灯单击 → 恢复主窗口。
+/// 与托盘“打开主界面”共用 show_main 同一入口（显示/还原/聚焦 + 隐藏呼吸灯）。
+#[tauri::command]
+pub fn restore_from_indicator(app: AppHandle) {
+    crate::tray::show_main(&app);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

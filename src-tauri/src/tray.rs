@@ -142,11 +142,16 @@ fn handle_tray_icon(app: &AppHandle, event: TrayIconEvent) {
     }
 }
 
-fn show_main(app: &AppHandle) {
+/// 恢复主界面（托盘“打开主界面”与呼吸灯单击共用入口）：
+/// 先还原最小化态，再显示并聚焦；同时隐藏状态呼吸灯。
+pub(crate) fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
         let _ = w.unminimize();
+        let _ = w.show();
         let _ = w.set_focus();
+    }
+    if let Some(ind) = app.get_webview_window("indicator") {
+        let _ = ind.hide();
     }
 }
 

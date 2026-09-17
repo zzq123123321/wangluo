@@ -26,10 +26,24 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // 阶段 9：关闭窗口只隐藏到托盘，进程与同步继续；退出只能走托盘“退出 ClipLink”。
+        // T11-03B：主窗口最小化被接管为“隐藏 + 显示状态呼吸灯”，不再保留任务栏最小化形态。
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
-                api.prevent_close();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+                tauri::WindowEvent::Resized(_) => {
+                    // Windows 最小化会触发 Resized 且 is_minimized 为真，据此拦截接管。
+                    if window.label() == "main" && window.is_minimized().unwrap_or(false) {
+                        tracing::debug!("主窗口最小化：隐藏并显示状态呼吸灯");
+                        let _ = window.hide();
+                        if let Some(ind) = window.app_handle().get_webview_window("indicator") {
+                            let _ = ind.show();
+                        }
+                    }
+                }
+                _ => {}
             }
         })
         .setup(|app| {
@@ -95,6 +109,42 @@ pub fn run() {
             let tray = tray::setup(app.handle())?;
             app.manage(tray);
 
+            // T11-03B：状态呼吸灯窗口——极小的无边框透明浮窗，始终置顶、不进任务栏。
+            // 默认隐藏：只有用户主动最小化主窗口才显示（--minimized 静默启动不弹呼吸灯）。
+            let indicator =
+                tauri::WebviewWindowBuilder::new(app, "indicator", tauri::WebviewUrl::default())
+                    .title("ClipLink 状态")
+                    .inner_size(40.0, 40.0)
+                    .min_inner_size(40.0, 40.0)
+                    .resizable(false)
+                    .decorations(false)
+                    .always_on_top(true)
+                    .transparent(true)
+                    .skip_taskbar(true)
+                    .shadow(false)
+                    .visible(false)
+                    .build()?;
+
+            // 运行时创建的 Windows WebView2 偶发把窗口宽度撑到默认值，
+            // 这里在建窗后再次确认 40×40 逻辑尺寸，再按实际外框定位到工作区右下角。
+            let _ = indicator.set_size(tauri::Size::Logical(tauri::LogicalSize::new(40.0, 40.0)));
+
+            // 定位到工作区右下角（work area 已避开任务栏），留 12px 边距。
+            if let Ok(Some(monitor)) = indicator.primary_monitor() {
+                let wa = monitor.work_area();
+                let size = indicator.outer_size().unwrap_or_default();
+                let margin = 12;
+                let x = wa.position.x + wa.size.width as i32 - size.width as i32 - margin;
+                let y = wa.position.y + wa.size.height as i32 - size.height as i32 - margin;
+                let _ = indicator.set_position(tauri::PhysicalPosition::new(
+                    x.max(wa.position.x),
+                    y.max(wa.position.y),
+                ));
+            }
+
+            // 呼吸灯单击恢复主窗口的命令入口（invoke 走 RPC，不走事件系统）。
+            // 这里不注册任何 listen_any；IndicatorApp 通过 invoke("restore_from_indicator") 直达。
+
             // 阶段 9：开机启动的静默到托盘（注册表启动项携带 --minimized）。
             // 顺带做一次注册表与配置的一致性修复：配置开启但注册项缺失时（如被手动删除）补写。
             if std::env::args().any(|a| a == "--minimized") {
@@ -136,6 +186,7 @@ pub fn run() {
             commands::connect_peer,
             commands::disconnect_peer,
             commands::update_settings,
+            commands::restore_from_indicator,
             commands::get_device_identity_summary
         ])
         .run(tauri::generate_context!())
