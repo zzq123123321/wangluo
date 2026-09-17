@@ -20,6 +20,8 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 pub const STATUS_EVENT: &str = "connection-status-changed";
+/// 目标机网络延迟更新事件（复用现有 ping/pong 心跳的 RTT，T11-03A）。
+pub const LATENCY_EVENT: &str = "network-latency-changed";
 /// 最近剪贴板消息 ID 去重队列上限（阶段 7，应用重启后无需保留）。
 pub const MAX_RECENT_MESSAGE_IDS: usize = 100;
 
@@ -33,9 +35,18 @@ pub struct ConnectionStatusEvent {
     pub generation: u64,
 }
 
+/// RTT 事件 payload：本机记录的 ping 往返毫秒数 + 产生它的连接代次。非敏感。
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkLatencyEvent {
+    pub latency_ms: u64,
+    pub generation: u64,
+}
+
 /// 状态事件出口：生产环境为 TauriStatusSink（写 AppState + emit），测试用收集型实现。
 pub trait StatusSink: Send + Sync {
     fn on_status(&self, ev: &ConnectionStatusEvent);
+    /// RTT 更新（复用现有心跳的往返时间；默认 no-op，其余实现无需为此改动）。
+    fn on_latency(&self, _ev: &NetworkLatencyEvent) {}
 }
 
 pub struct TauriStatusSink {
@@ -64,6 +75,10 @@ impl StatusSink for TauriStatusSink {
         let _ = self.app.emit(STATUS_EVENT, ev);
         // 阶段 9：连接/状态变化同步刷新托盘菜单“当前状态”项
         crate::tray::sync_from_state(&self.app);
+    }
+
+    fn on_latency(&self, ev: &NetworkLatencyEvent) {
+        let _ = self.app.emit(LATENCY_EVENT, ev);
     }
 }
 
@@ -102,6 +117,8 @@ pub struct HeartbeatState {
 #[derive(Debug)]
 struct PendingPing {
     id: String,
+    /// 本机发送 ping 时的墙钟毫秒（与协议 sent_at 同源）：RTT 只用本机记录计算，不信任对方时间。
+    sent_at: u64,
 }
 
 impl HeartbeatState {
@@ -116,20 +133,25 @@ impl HeartbeatState {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let sent_at = protocol::now_millis();
-        self.pending = Some(PendingPing { id: id.clone() });
+        self.pending = Some(PendingPing {
+            id: id.clone(),
+            sent_at,
+        });
         (Some((id, sent_at)), false)
     }
 
-    /// 收到 pong：仅当与当前 pending ping 匹配时复位计数；否则忽略（不错误恢复）。
-    pub fn on_pong(&mut self, ping_id: &str) -> bool {
+    /// 收到 pong：仅当与当前 pending ping 匹配时，用本机记录的 ping 发送时间计算 RTT（毫秒）
+    /// 并复位计数；否则返回 None（不匹配/过期 pong 不产生延迟事件、不错误重置 misses）。
+    pub fn on_pong(&mut self, ping_id: &str) -> Option<u64> {
         if let Some(p) = self.pending.as_ref() {
             if p.id == ping_id {
+                let rtt_ms = protocol::now_millis().saturating_sub(p.sent_at);
                 self.pending = None;
                 self.misses = 0;
-                return true;
+                return Some(rtt_ms);
             }
         }
-        false
+        None
     }
 
     #[cfg(test)]
@@ -932,8 +954,11 @@ impl NetworkManager {
             },
             protocol::MSG_PONG => match protocol::parse_pong(msg) {
                 Some(pong) => {
-                    let matched = conn.heartbeat.lock().unwrap().on_pong(&pong.ping_id);
-                    tracing::debug!(gen = conn.generation, matched, "收到 pong");
+                    let rtt_ms = conn.heartbeat.lock().unwrap().on_pong(&pong.ping_id);
+                    if let Some(ms) = rtt_ms {
+                        self.emit_latency_if_current(conn.generation, ms);
+                    }
+                    tracing::debug!(gen = conn.generation, rtt_ms = ?rtt_ms, "收到 pong");
                     Handled::Continue
                 }
                 None => Handled::Fail(AppError::ProtocolInvalidJson),
@@ -1080,17 +1105,32 @@ impl NetworkManager {
         (self.core.sink.as_ref()).on_status(ev);
     }
 
+    /// 当前连接槽位是否仍属于指定 generation（旧连接晚到的状态/RTT 事件不应覆盖新连接）。
+    fn generation_is_current(&self, generation: u64) -> bool {
+        self.core
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .as_ref()
+            .is_some_and(|s| s.generation == generation)
+    }
+
     /// 仅当前活动连接（generation 匹配槽位）可发送非终结事件；
     /// 旧连接任务在终结前若已被新连接取代，其事件不再发出，避免覆盖新连接状态。
     fn emit_if_current(&self, ev: &ConnectionStatusEvent) {
-        let owns = {
-            let g = self.core.inner.lock().unwrap();
-            g.conn
-                .as_ref()
-                .is_some_and(|s| s.generation == ev.generation)
-        };
-        if owns {
+        if self.generation_is_current(ev.generation) {
             self.emit(ev);
+        }
+    }
+
+    /// RTT 事件同样按 generation 过滤：旧连接产生的 RTT 不得更新新连接的延迟。
+    fn emit_latency_if_current(&self, conn_generation: u64, rtt_ms: u64) {
+        if self.generation_is_current(conn_generation) {
+            (self.core.sink.as_ref()).on_latency(&NetworkLatencyEvent {
+                latency_ms: rtt_ms,
+                generation: conn_generation,
+            });
         }
     }
 }
@@ -1183,31 +1223,46 @@ mod tests {
         assert_eq!(ev.status, ConnectionStatus::Offline);
     }
 
-    // 31：ping 收到对应 pong 后保持连接（丢失计数复位）
+    // 31：ping 收到对应 pong 后保持连接（丢失计数复位），并返回本机计算的 RTT
     #[test]
     fn heartbeat_pong_keeps_connection() {
         let mut hb = HeartbeatState::default();
         let (p1, t1) = hb.on_tick();
         assert!(!t1);
         let id = p1.unwrap().0;
-        assert!(hb.on_pong(&id));
+        let rtt = hb.on_pong(&id).expect("匹配 pong 应返回 RTT");
+        assert!(rtt < 5000, "RTT 应为本机记录的合理毫秒数，得到 {rtt}");
         let (p2, t2) = hb.on_tick();
         assert!(!t2);
         assert!(p2.is_some());
         assert_eq!(hb.misses(), 0);
     }
 
-    // 32：不匹配/过期 pong 不重置丢失计数
+    // 32：不匹配/过期 pong 不产生 RTT，也不重置丢失计数
     #[test]
     fn heartbeat_mismatched_pong_does_not_reset() {
         let mut hb = HeartbeatState::default();
         let (p1, _) = hb.on_tick();
-        assert!(!hb.on_pong("other-id"));
+        assert!(hb.on_pong("other-id").is_none());
         let (_, _) = hb.on_tick();
         assert_eq!(hb.misses(), 1);
-        // p1 的迟到 pong：pending 已换成新 ping，不匹配 → 计数不变
-        assert!(!hb.on_pong(&p1.unwrap().0));
+        // p1 的迟到 pong：pending 已换成新 ping，不匹配 → 无 RTT、计数不变
+        assert!(hb.on_pong(&p1.unwrap().0).is_none());
         assert_eq!(hb.misses(), 1);
+    }
+
+    // T11-03A：同一 pending ping 的 pong 只匹配一次（RTT 只产生一次），随后为 None
+    #[test]
+    fn heartbeat_pong_returns_rtt_only_once() {
+        let mut hb = HeartbeatState::default();
+        let (p1, _) = hb.on_tick();
+        let id = p1.unwrap().0;
+        assert!(hb.on_pong(&id).is_some(), "首次匹配应产生 RTT");
+        assert!(
+            hb.on_pong(&id).is_none(),
+            "pending 已消费，重复 pong 不应再产生 RTT"
+        );
+        assert_eq!(hb.misses(), 0);
     }
 
     // 33：连续 3 次无 pong 触发超时

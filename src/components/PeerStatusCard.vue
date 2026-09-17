@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { store, disconnectPeer, togglePause } from "../stores/app";
 
 const borderTone = computed(() => {
@@ -21,6 +22,46 @@ const detailText = computed(() => {
   if (store.status === "error") return store.statusText;
   return "";
 });
+
+/** network-latency-changed 事件 payload（与 Rust 侧 NetworkLatencyEvent 对应） */
+interface LatencyEvent {
+  latency_ms: number;
+  generation: number;
+}
+
+/** 最近一次有效心跳 RTT（毫秒）。null = 尚未取得第一笔有效测量。 */
+const latencyMs = ref<number | null>(null);
+
+let unlistenLatency: UnlistenFn | null = null;
+
+onMounted(async () => {
+  try {
+    unlistenLatency = await listen<LatencyEvent>("network-latency-changed", (ev) => {
+      if (store.demoState) return;
+      latencyMs.value = ev.payload.latency_ms;
+    });
+  } catch {
+    // 无 Tauri 事件通道（纯浏览器开发环境）时忽略
+  }
+});
+
+// 组件销毁时解除事件监听，避免累积监听器
+onUnmounted(() => {
+  unlistenLatency?.();
+  unlistenLatency = null;
+});
+
+/** 连接断开、进入重连/错误/离线，或对方 IP 改变时立即清空旧延迟：
+ *  新连接在收到第一笔有效 pong 之前不得继续显示上一条连接的旧 RTT。 */
+watch(
+  () => [store.status, store.peerIp] as const,
+  ([status, ip], [, prevIp]) => {
+    const active = status === "connected" || status === "paused";
+    if (!active || prevIp !== ip) {
+      latencyMs.value = null;
+    }
+  }
+);
 
 const pauseDisabled = computed(
   () => store.status !== "connected" && store.status !== "paused"
@@ -48,7 +89,7 @@ function onDisconnect() {
         <span class="name">{{ headerLabel }}{{ store.peerDeviceName }}</span>
       </div>
       <div class="detail">
-        {{ store.peerIp }}<template v-if="detailText"> · {{ detailText }}</template>
+        {{ store.peerIp }}<template v-if="latencyMs !== null"> · 延迟 {{ latencyMs }} ms</template><template v-if="detailText"> · {{ detailText }}</template>
       </div>
       <div class="row buttons">
         <button :disabled="pauseDisabled" @click="pause">{{ store.paused ? "恢复" : "暂停" }}</button>
