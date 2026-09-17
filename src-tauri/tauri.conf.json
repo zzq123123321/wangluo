@@ -26,15 +26,12 @@
     }
   },
   "bundle": {
-    "active": true,
-    "targets": [
-      "nsis"
-    ],
+    "active": false,
     "publisher": "LocalUser",
     "copyright": "Copyright \u00A9 2026 LocalUser",
     "category": "Utility",
-    "shortDescription": "ClipLink 局域网剪贴板同步",
-    "longDescription": "ClipLink 通过 ZeroTier 网络在两台或多台 Windows 电脑之间同步剪贴板文本（TCP 45888，加密 + 校验和，任何时刻只保留一个同步通道）。",
+    "shortDescription": "ClipLink 两台电脑剪贴板同步",
+    "longDescription": "ClipLink 通过 ZeroTier 网络在两台 Windows 电脑之间双向同步纯文字剪贴板。",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
