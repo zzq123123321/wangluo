@@ -19,6 +19,7 @@ const dotClass = computed(() => `dot ${STATUS_COLOR[store.status]}`);
       <span class="state-text" :data-status="store.status">{{ store.statusText }}</span>
     </div>
   </header>
+  <div v-if="store.error && store.error.trim()" class="error" role="alert">⚠ {{ store.error }}</div>
 </template>
 
 <style scoped>
@@ -64,6 +65,16 @@ const dotClass = computed(() => `dot ${STATUS_COLOR[store.status]}`);
 .state-text[data-status="reconnecting"],
 .state-text[data-status="connecting"] { color: var(--yellow); }
 .state-text[data-status="error"] { color: var(--red); }
+.error {
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--red);
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  padding: 6px 10px;
+  word-break: break-word;
+}
 .dot {
   width: 10px;
   height: 10px;

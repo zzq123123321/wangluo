@@ -145,6 +145,40 @@
   - 测试：**104 单元 + 18 集成 = 122/122 通过**（新增 6 单元，原 116 全部保留），
     `cargo fmt --check`/`cargo test -- --test-threads=1`/`cargo check`/`npm run build`/`git diff --check` 全绿。
   - 提交：`test: strengthen settings state coverage`（已推送 origin/main）。
+- T11-10 PASS：主界面错误提示渲染、残留死按钮清理与最近同步健壮性收尾。
+  - **发现并修复：`store.error` 从未在主界面渲染（阶段 6 遗留）**——`app-error` 事件与多处
+    catch 将错误文案写入 `store.error`，但整个前端模板从未读取该字段，用户在剪贴板超限、
+    autostart/刷新 ZeroTier 等真实失败场景下完全看不到任何提示。修复：在 `StatusBanner.vue`
+    新增轻量错误提示条——`v-if="store.error && store.error.trim()"` 读取 `store.error`，
+    带 ⚠ 前缀、红色边框/文字、`word-break: break-word`，显示在 banner 头下方；不设自动消失计时器，
+    不替代正常 `statusText`，不影响无错误时的布局高度。
+  - **发现并修复："打开设置"死按钮长期残留（阶段 2 引入、阶段 11 标注但仍保留）**——
+    `<button class="link" disabled title="阶段 11 实现">打开设置</button>` 始终禁用，
+    产品定义无设置页。删除该按钮及对应的 `.link` CSS；底部行仅保留"开机启动"+开发环境"状态预览"。
+  - **修复：`formatSync` 泄漏 "Invalid Date" 英文**——demo 环境 `lastSync` 为友好文本而非
+    epoch 毫秒，`new Date("来自...")` 返回 Invalid Date 但不抛异常，try/catch 兜不住，
+    中文界面显示 `最近同步：Invalid Date`。修复：新增数字校验 `!(/^\d+$/.test(ms))` 后直接返回
+    "暂无"；真实后端始终发送 epoch 毫秒字符串，不受影响。
+  - 审查确认（无其余 UI 缺陷）：
+    - 状态颜色一致性：`STATUS_COLOR`、StatusBanner `.dot`/`.state-text[data-status]`、
+      PeerStatusCard `.dot.{status}`/`borderTone`、IndicatorApp `toneOf` 四源映射一致，
+      Connected 绿 / Connecting·Reconnecting 黄 / Error 红 / Offline·Paused 灰。
+    - 网络延迟显示：`latencyMs` 初始 null，仅 `network-latency-changed` 事件更新；watch 在
+      status 离开 connected/paused 或 peerIp 变化时立即清空；未取得 RTT 时模板不渲染
+      "延迟 xx ms"；demo 模式下事件监听跳过、不伪造延迟。
+    - ZeroTier 未发现：`zerotierHint` + `hintWarn` 红色警告文案明确，输入框 readonly、
+      "复制"按钮 disabled；Demo `no_zerotier` 状态文案与文档逐字一致。
+    - 暂停：PeerStatusCard 按钮 `store.paused ? "恢复" : "暂停"`；状态文字经 STATUS_TEXT 
+      / connection-status-changed 事件一致更新。
+    - 呼吸灯：`IndicatorApp` `toneOf` 复用同一映射，绿色=Connected、黄色=Connecting·Reconnecting、
+      红色=Error、灰色=Offline·Paused。
+  - 附带清理：9 张状态截图已生成存于 `%TEMP%\opencode\t1110-shots\` 供视觉验收子会话逐张
+    核对（DOM 级已验证错误条渲染、死按钮消失、最近同步显示"暂无"），视觉验收需由总指挥
+    另开视觉会话（本端模型无视觉能力）。
+  - 测试：**104 单元 + 18 集成 = 122/122 通过**（无新增/无删除，基线完整），
+    `cargo fmt --check`/`cargo test -- --test-threads=1`/`cargo check`/`npm run build`/
+    `git diff --check` 全绿。
+  - 提交：`fix: polish release status feedback`（已推送 origin/main）。
 
 ## 环境事实（2026-09-16 核验）
 

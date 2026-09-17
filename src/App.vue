@@ -23,6 +23,7 @@ const DevSwitcher = ref<Component | null>(null);
 /** 格式化最近同步时间（epoch ms 字符串 → 本地 HH:MM:SS） */
 function formatSync(ms: string | null): string {
   if (!ms) return "暂无";
+  if (!/^\d+$/.test(ms)) return "暂无";
   try {
     return new Date(Number(ms)).toLocaleTimeString();
   } catch {
@@ -48,6 +49,9 @@ onMounted(async () => {
     const { DEMO_STATES, applyDemo } = await import("./stores/demo");
     const key = params.get("demo");
     if (key && key in DEMO_STATES) applyDemo(key as DemoKey);
+    // 开发预览：注入一条 app-error 提示（与 demo 叠加验证错误展示位）
+    const errTest = params.get("errtest");
+    if (errTest) store.error = errTest;
     DevSwitcher.value = (await import("./components/DevStateSwitcher.vue")).default;
   }
   // 后端 ZeroTier IP 变化事件：拉取最新快照刷新界面（演示模式下 refreshSnapshot 自动跳过）
@@ -108,7 +112,6 @@ onMounted(async () => {
           <span>开机启动</span>
         </label>
         <component :is="DevSwitcher" v-if="dev && DevSwitcher" />
-        <button class="link" disabled title="阶段 11 实现">打开设置</button>
       </div>
     </div>
   </main>
@@ -132,12 +135,5 @@ onMounted(async () => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-}
-.link {
-  background: none;
-  box-shadow: none;
-  border: none;
-  color: var(--muted);
-  padding: 0.2em 0.6em;
 }
 </style>
