@@ -232,6 +232,14 @@ struct ConnSlot {
     conn: Arc<Conn>,
 }
 
+/// writer 队列项：bytes 为待写帧；ack 仅用于握手 hello（Some 时帧真正写入
+/// socket 成功后经 oneshot 通知发起方，失败则回 Err），其余帧不带 ack。
+/// 这是本机内部写完成确认，不改变线上协议，也不新增任何网络消息。
+struct WriterItem {
+    bytes: Vec<u8>,
+    ack: Option<tokio::sync::oneshot::Sender<Result<(), AppError>>>,
+}
+
 pub struct Conn {
     generation: u64,
     cancel: CancellationToken,
@@ -239,8 +247,8 @@ pub struct Conn {
     peer_closed: AtomicBool,
     heartbeat_lost: AtomicBool,
     settled: AtomicBool,
-    writer_tx: mpsc::UnboundedSender<Vec<u8>>,
-    writer_rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
+    writer_tx: mpsc::UnboundedSender<WriterItem>,
+    writer_rx: Mutex<Option<mpsc::UnboundedReceiver<WriterItem>>>,
     heartbeat: Mutex<HeartbeatState>,
 }
 
@@ -338,9 +346,44 @@ impl NetworkManager {
             return Err(AppError::ConnectionClosed);
         };
         let bytes = protocol::encode(msg)?;
+        self.queue_bytes(&conn, bytes)
+    }
+
+    /// 将编码帧入队写 socket（无写完成确认；ping/pong/剪贴板/disconnect 等普通帧用）。
+    fn queue_bytes(&self, conn: &Conn, bytes: Vec<u8>) -> Result<(), AppError> {
         conn.writer_tx
-            .send(bytes)
+            .send(WriterItem { bytes, ack: None })
             .map_err(|_| AppError::ConnectionClosed)
+    }
+
+    /// 将编码帧入队写 socket，并等待 writer 真正写完成后再返回（握手 hello 用）。
+    /// writer 写失败 / 通道关闭 / 超时均返回 Err，防止“入站 Connected 早于自己的
+    /// hello 真正发出”造成两端状态不对称。
+    async fn queue_bytes_with_ack(
+        &self,
+        conn: &Conn,
+        bytes: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<(), AppError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        conn.writer_tx
+            .send(WriterItem {
+                bytes,
+                ack: Some(ack_tx),
+            })
+            .map_err(|_| AppError::ConnectionClosed)?;
+        tokio::select! {
+            _ = conn.cancel.cancelled() => {
+                // 取消（用户断开/超时）时写入结果不再可信，按连接关闭处理
+                Err(AppError::ConnectionClosed)
+            }
+            r = time::timeout(timeout, ack_rx) => match r {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(e))) => Err(e),
+                Ok(Err(_)) => Err(AppError::ConnectionClosed),
+                Err(_) => Err(AppError::HandshakeTimeout),
+            },
+        }
     }
 
     /// 阶段 7：消息 ID 去重。已见过的 ID 返回 true（调用方忽略该消息）；否则记录并返回 false。
@@ -499,7 +542,7 @@ impl NetworkManager {
         }
         g.next_generation += 1;
         let gen = g.next_generation;
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::unbounded_channel::<WriterItem>();
         let conn = Arc::new(Conn {
             generation: gen,
             cancel: CancellationToken::new(),
@@ -575,7 +618,7 @@ impl NetworkManager {
             },
         ) {
             if let Ok(bytes) = protocol::encode(&msg) {
-                let _ = conn.writer_tx.send(bytes);
+                let _ = conn.writer_tx.send(WriterItem { bytes, ack: None });
             }
         }
         conn.cancel.cancel();
@@ -740,7 +783,8 @@ impl NetworkManager {
         let _ = stream.set_nodelay(true);
         let (mut rd, mut wr) = stream.into_split();
 
-        // writer 任务：唯一写 socket 的任务，串行发送通道中的帧
+        // writer 任务：唯一写 socket 的任务，串行发送通道中的帧。
+        // hello 帧带有写完成确认（ack）：写成功 → Ok，写失败/通道关闭 → Err。
         let writer = {
             let conn2 = conn.clone();
             async move {
@@ -752,18 +796,32 @@ impl NetworkManager {
                     tokio::select! {
                         _ = conn2.cancel.cancelled() => {
                             // 取消后先排空已入队帧（如用户 disconnect 消息），再关闭
-                            while let Ok(bytes) = rx.try_recv() {
-                                if wr.write_all(&bytes).await.is_err() {
+                            while let Ok(item) = rx.try_recv() {
+                                let r = wr.write_all(&item.bytes).await;
+                                if r.is_err() {
+                                    if let Some(ack) = item.ack {
+                                        let _ = ack.send(Err(AppError::ConnectionClosed));
+                                    }
                                     break;
+                                }
+                                if let Some(ack) = item.ack {
+                                    let _ = ack.send(Ok(()));
                                 }
                             }
                             break;
                         }
                         item = rx.recv() => {
                             match item {
-                                Some(bytes) => {
-                                    if wr.write_all(&bytes).await.is_err() {
+                                Some(item) => {
+                                    let r = wr.write_all(&item.bytes).await;
+                                    if r.is_err() {
+                                        if let Some(ack) = item.ack {
+                                            let _ = ack.send(Err(AppError::ConnectionClosed));
+                                        }
                                         break;
+                                    }
+                                    if let Some(ack) = item.ack {
+                                        let _ = ack.send(Ok(()));
                                     }
                                 }
                                 None => break,
@@ -838,7 +896,7 @@ impl NetworkManager {
                             },
                         ) {
                             if let Ok(bytes) = protocol::encode(&msg) {
-                                let _ = conn2.writer_tx.send(bytes);
+                                let _ = conn2.writer_tx.send(WriterItem { bytes, ack: None });
                             }
                         }
                     }
@@ -866,11 +924,11 @@ impl NetworkManager {
         let their = if inbound {
             self.read_hello_or_cancel(conn, rd, timeout).await?
         } else {
+            // 出站：先发自己的 hello，并确认已真正写入 socket，再等对方 hello。
+            // 写失败/超时直接返回 Err，避免只在“对方未回”时判定失败的不对称。
             let hello = self.build_hello();
             let bytes = protocol::encode(&hello)?;
-            if conn.writer_tx.send(bytes).is_err() {
-                return Err(AppError::ConnectionClosed);
-            }
+            self.queue_bytes_with_ack(conn, bytes, timeout).await?;
             self.read_hello_or_cancel(conn, rd, timeout).await?
         };
         if their.version != protocol::PROTOCOL_VERSION {
@@ -883,7 +941,7 @@ impl NetworkManager {
             );
             if let Ok(err) = err {
                 if let Ok(bytes) = protocol::encode(&err) {
-                    let _ = conn.writer_tx.send(bytes);
+                    let _ = conn.writer_tx.send(WriterItem { bytes, ack: None });
                 }
             }
             tracing::warn!(
@@ -895,11 +953,11 @@ impl NetworkManager {
         }
         let payload = protocol::validate_hello(&their, &self.core.device_id)?;
         if inbound {
+            // 入站：等到自己的 hello 真正写完成才返回 Ok（仅入队不等于已发出），
+            // 防止被动端先于数据实达而误报 Connected，两端状态因此保持对称。
             let hello = self.build_hello();
             let bytes = protocol::encode(&hello)?;
-            if conn.writer_tx.send(bytes).is_err() {
-                return Err(AppError::ConnectionClosed);
-            }
+            self.queue_bytes_with_ack(conn, bytes, timeout).await?;
         }
         Ok(PeerInfo {
             device_name: payload.device_name.trim().to_string(),
@@ -986,7 +1044,7 @@ impl NetworkManager {
                         },
                     ) {
                         if let Ok(bytes) = protocol::encode(&pong) {
-                            let _ = conn.writer_tx.send(bytes);
+                            let _ = conn.writer_tx.send(WriterItem { bytes, ack: None });
                         }
                     }
                     Handled::Continue
@@ -1197,6 +1255,7 @@ pub fn validate_peer_target(ip: &str, local_zt_ip: Option<&str>) -> Result<Ipv4A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest;
     use tokio::io::AsyncWriteExt;
 
     const TEST_PEER_DEVICE_ID: &str = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
@@ -1786,6 +1845,181 @@ mod tests {
             "不得发出 Connecting/Reconnecting 事件"
         );
         m.finalize(conn, CloseCause::User);
+        m.shutdown().await;
+    }
+
+    /// 测试辅助：构造一条对端 hello，用于模拟“对方”完成握手。
+    fn peer_hello(device_id: &str, device_name: &str) -> protocol::Message {
+        protocol::Message::new(
+            protocol::MSG_HELLO,
+            device_id,
+            &protocol::HelloPayload {
+                device_id: device_id.to_string(),
+                device_name: device_name.to_string(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            },
+        )
+        .unwrap()
+    }
+
+    /// 等待某个状态出现（最多 2 秒）。
+    async fn wait_status(sink: &Arc<VecSink>, want: ConnectionStatus) -> bool {
+        for _ in 0..40 {
+            if sink.0.lock().unwrap().iter().any(|e| e.status == want) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    fn last_status(sink: &Arc<VecSink>) -> Option<ConnectionStatus> {
+        sink.last().map(|e| e.status)
+    }
+
+    // T11-11-FIX1：出站 hello 未真正写入时不得返回 Ok（写失败应导致握手失败，
+    // 而不是一边 Connected、另一边等不到 hello 而超时）。
+    #[tokio::test]
+    async fn outbound_handshake_fails_when_hello_write_breaks() {
+        let (m, sink) = test_manager();
+        // 监听一个回环端口作为“对端”；连接后立刻关闭写端，使本端 hello 写入失败。
+        let listen = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listen.local_addr().unwrap().port();
+        m.connect_inner("127.0.0.1", port, false).await.unwrap();
+        let (mut stream, _) = listen.accept().await.unwrap();
+        // 对端立即断开（shutdown 写），本端写 hello 时应失败而非悬挂
+        let _ = stream.shutdown().await;
+        let _ = stream;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !wait_status(&sink, ConnectionStatus::Connected).await,
+            "写失败时出站握手不得进入 Connected"
+        );
+        assert!(!m.is_busy(), "写失败后槽位应释放");
+        m.shutdown().await;
+    }
+
+    // T11-11-FIX1：出站正常握手不受影响——hello 写入成功 + 收到对端 hello → Connected。
+    #[tokio::test]
+    async fn outbound_handshake_success_still_connected() {
+        let (m, sink) = test_manager();
+        let listen = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listen.local_addr().unwrap().port();
+        m.connect_inner("127.0.0.1", port, false).await.unwrap();
+        let (stream, _) = listen.accept().await.unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+        let mhello = read_any(&mut rd).await;
+        assert_eq!(mhello.msg_type, protocol::MSG_HELLO);
+        let hello = peer_hello(TEST_PEER_DEVICE_ID, "TEST-PEER-B");
+        wr.write_all(&protocol::encode(&hello).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            wait_status(&sink, ConnectionStatus::Connected).await,
+            "出站正常握手应进入 Connected，实际 {:?}",
+            last_status(&sink)
+        );
+        m.disconnect().await;
+        m.shutdown().await;
+    }
+
+    // T11-11-FIX1：入站（被动端）的 hello 未真正写入时不得 emit Connected——
+    // 必须等 writer 写完成才允许报告已连接，两端状态因此对称。
+    #[tokio::test]
+    async fn inbound_handshake_waits_for_hello_write_before_connected() {
+        let (m, sink) = test_manager();
+        let conn = m.claim_conn().unwrap();
+        // 模拟 writer 无法发送 hello 响应：直接把接收端丢弃，使 writer 任务不存在/失败，
+        // 同时驱动入站握手——被动端必须在 hello 写失败时拒绝进入 Connected。
+        drop(conn.writer_rx.lock().unwrap().take());
+        // 构造一个真实可用的回环 stream 承载握手（读对端 hello 正常，写本端 hello 失败）
+        let listen = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listen.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server = listen.accept().await.unwrap().0;
+        // 对端先发 hello（本端能正常读到）
+        let (cl_rd, mut cl_wr) = client.into_split();
+        let hello = peer_hello(TEST_PEER_DEVICE_ID, "TEST-PEER-A");
+        cl_wr
+            .write_all(&protocol::encode(&hello).unwrap())
+            .await
+            .unwrap();
+
+        let m2 = m.clone();
+        let peer_ip = addr.to_string();
+        tokio::spawn(async move {
+            m2.drive(conn.clone(), Some(server), true, peer_ip, 0).await;
+        });
+        let _ = cl_rd;
+        // 由于 writer_rx 已被丢弃，hello 响应无法写出去；Connect 不应出现
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !wait_status(&sink, ConnectionStatus::Connected).await,
+            "hello 未写入时不得 emit Connected"
+        );
+        // 连接因写失败关闭后槽位应释放（等待最终 finalize 完成）
+        let mut released = false;
+        for _ in 0..40 {
+            if !m.is_busy() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(released, "hello 写失败后槽位必须释放");
+        m.shutdown().await;
+    }
+
+    // T11-11-FIX1：入站正常握手——hello 写完成后才 Connected。
+    #[tokio::test]
+    async fn inbound_handshake_success_connected_after_write() {
+        let (m, sink) = test_manager();
+        let listen = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listen.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server = listen.accept().await.unwrap().0;
+        // 启动被动端连接任务（先于发送/读取，保证 hello 响应由 drive 写出）
+        let m2 = m.clone();
+        let conn = m2.claim_conn().unwrap();
+        let peer_ip = addr.to_string();
+        tokio::spawn(async move {
+            m2.drive(conn.clone(), Some(server), true, peer_ip, 0).await;
+        });
+        // 对端发 hello，再读回本端 hello，确认响应真实到达后才等 Connected
+        let (mut cl_rd, mut cl_wr) = client.into_split();
+        let hello = peer_hello(TEST_PEER_DEVICE_ID, "TEST-PEER-A");
+        cl_wr
+            .write_all(&protocol::encode(&hello).unwrap())
+            .await
+            .unwrap();
+        let mhello = read_any(&mut cl_rd).await;
+        assert_eq!(
+            mhello.msg_type,
+            protocol::MSG_HELLO,
+            "对端应读到被动端写出的 hello"
+        );
+
+        assert!(
+            wait_status(&sink, ConnectionStatus::Connected).await,
+            "正常入站握手应进入 Connected，实际 {:?}",
+            last_status(&sink)
+        );
+        // 剪贴板消息能正常经该连接发送（验证 writer 通道仍可用）
+        let text = "T11-11-FIX1-test".to_string();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(text.as_bytes());
+        let content_hash = crate::identity::hex_encode(&hasher.finalize());
+        let payload = protocol::ClipboardPayload { text, content_hash };
+        let msg = protocol::Message::new(
+            protocol::MSG_CLIPBOARD_UPDATE,
+            "550e8400-e29b-41d4-a716-446655440000",
+            &payload,
+        )
+        .unwrap();
+        m.send_message(&msg).unwrap();
+        let got = read_any(&mut cl_rd).await;
+        assert_eq!(got.msg_type, protocol::MSG_CLIPBOARD_UPDATE);
+        m.disconnect().await;
         m.shutdown().await;
     }
 }
