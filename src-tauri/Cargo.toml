@@ -25,7 +25,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4"
-winapi = { version = "0.3", features = ["iphlpapi", "iptypes", "winsock2", "winbase"] }
+winapi = { version = "0.3", features = ["iphlpapi", "iptypes", "winsock2", "winbase", "winuser", "errhandlingapi", "synchapi"] }
 tokio = { version = "1", features = ["time", "net", "io-util", "sync", "macros"] }
 tokio-util = "0.7"
 getrandom = "0.2"
