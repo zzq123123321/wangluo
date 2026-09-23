@@ -103,6 +103,60 @@ impl ExternalStatusWriter {
     }
 }
 
+/// 远程剪贴板到达事件：ClipLink 每成功接收一次远端 A 的 clipboard_update 写一份，
+/// 供 AI Relay 以 event_id 去重（绝不靠“系统剪贴板变了”猜来源）。单槽文件，
+/// 只含非敏感信息（无 secret/key/token），此处允许把 A 端原文落本机。
+#[derive(Serialize)]
+struct RemoteClipboardEvent {
+    version: u32,
+    event_id: String,
+    text: String,
+    content_hash: String,
+    updated_at: u64,
+}
+
+/// 远程剪贴板到达事件写入器：记住事件文件路径；每次 record 生成全新 event_id 并原子写。
+/// 写失败只 warn、绝不 panic、绝不影响剪贴板同步。
+pub struct RemoteClipboardWriter {
+    path: PathBuf,
+}
+
+impl RemoteClipboardWriter {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// 默认位置：%LOCALAPPDATA%\ClipLink\remote_clipboard.json（本机固定，与 Tauri app_data 目录无关）。
+    pub fn default_path() -> PathBuf {
+        let base =
+            std::env::var_os("LOCALAPPDATA").unwrap_or_else(|| std::ffi::OsString::from("."));
+        PathBuf::from(base)
+            .join("ClipLink")
+            .join("remote_clipboard.json")
+    }
+
+    /// 记录一次“远端剪贴板到达”：生成全新 event_id 并原子写文件。写失败只 warn。
+    pub fn record(&self, text: &str, content_hash: &str) {
+        let file = RemoteClipboardEvent {
+            version: 1,
+            event_id: uuid::Uuid::new_v4().to_string(),
+            text: text.to_string(),
+            content_hash: content_hash.to_string(),
+            updated_at: protocol::now_millis(),
+        };
+        let bytes = match serde_json::to_vec_pretty(&file) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %self.path.display(), %e, "远程剪贴板事件序列化失败，跳过写入");
+                return;
+            }
+        };
+        if let Err(e) = atomic_write(&self.path, &bytes) {
+            tracing::warn!(path = %self.path.display(), %e, "远程剪贴板事件写入失败（辅助文件，不影响剪贴板同步）");
+        }
+    }
+}
+
 /// 原子写：先写 <name>.tmp 并 flush/sync，再 rename 覆盖目标，避免 AI Relay 读到半截 JSON。
 /// 目标父目录不存在时先创建。任一步失败返回 Err（调用方只 warn）。
 fn atomic_write(target: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -279,6 +333,87 @@ mod tests {
             w.record_status("connected", true, Some("A"), Some("1.2.3.4"), 1);
         }));
         assert!(result.is_ok(), "写状态文件失败不应 panic");
+        assert!(!target.exists(), "写失败时目标文件不应被创建");
+    }
+
+    // L04-03：remote_clipboard.json 写入器测试（只写 temp 目录，不碰真实 %LOCALAPPDATA%\ClipLink）
+    #[test]
+    fn remote_event_file_schema_correct() {
+        let d = fresh_dir("r1");
+        let target = d.join("remote_clipboard.json");
+        let w = RemoteClipboardWriter::new(target.clone());
+        w.record("A端原文", "abc123");
+        let v = read_file(&target); // 原子写后应可正常解析为 JSON
+        assert!(v.is_object());
+        for key in ["version", "event_id", "text", "content_hash", "updated_at"] {
+            assert!(v.get(key).is_some(), "缺少字段 {key}");
+        }
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["content_hash"], "abc123");
+        assert!(v["updated_at"].as_u64().unwrap() > 0);
+        assert!(!v["event_id"].as_str().unwrap().is_empty());
+        // 不含敏感字段
+        for key in [
+            "token",
+            "device_secret",
+            "shared_key",
+            "pairing_secret",
+            "secret",
+            "key",
+        ] {
+            assert!(v.get(key).is_none(), "意外出现敏感字段 {key}");
+        }
+    }
+
+    #[test]
+    fn remote_event_text_preserved_verbatim() {
+        let d = fresh_dir("r2");
+        let target = d.join("remote_clipboard.json");
+        let w = RemoteClipboardWriter::new(target.clone());
+        let original = "第一行\n第二行\t制表\n中文：剪贴板同步";
+        w.record(original, "deadbeef");
+        let v = read_file(&target);
+        assert_eq!(
+            v["text"].as_str().unwrap(),
+            original,
+            "文本须原样保存（含换行/制表/中文）"
+        );
+    }
+
+    #[test]
+    fn remote_event_content_hash_preserved() {
+        let d = fresh_dir("r3");
+        let target = d.join("remote_clipboard.json");
+        let w = RemoteClipboardWriter::new(target.clone());
+        w.record("x", "cafebabe64");
+        let v = read_file(&target);
+        assert_eq!(v["content_hash"].as_str().unwrap(), "cafebabe64");
+    }
+
+    #[test]
+    fn remote_event_id_differs_each_write() {
+        let d = fresh_dir("r4");
+        let target = d.join("remote_clipboard.json");
+        let w = RemoteClipboardWriter::new(target.clone());
+        w.record("same", "h1");
+        let e1 = read_file(&target)["event_id"].as_str().unwrap().to_string();
+        w.record("same", "h1"); // 相同内容再次写入
+        let e2 = read_file(&target)["event_id"].as_str().unwrap().to_string();
+        assert_ne!(e1, e2, "每次写入应生成新的 event_id");
+    }
+
+    #[test]
+    fn remote_event_write_failure_does_not_panic() {
+        let d = fresh_dir("r5");
+        // 父目录无法创建（blocker 是文件）→ 写失败
+        let blocker = d.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let target = blocker.join("remote_clipboard.json");
+        let w = RemoteClipboardWriter::new(target.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            w.record("hello", "h");
+        }));
+        assert!(result.is_ok(), "写事件文件失败不应 panic");
         assert!(!target.exists(), "写失败时目标文件不应被创建");
     }
 }

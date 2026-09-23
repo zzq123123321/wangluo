@@ -9,6 +9,7 @@
 //   3. 写入前复查暂停：暂停后不接受正在落地的远端内容写本机剪贴板；
 //   4. 更新最近同步时间并向前端发 clipboard-synced 事件。
 // 任务随 Tauri 全局 async runtime 生存，进程退出即销毁。
+use crate::external_status::RemoteClipboardWriter;
 use crate::identity::hex_encode;
 use crate::protocol;
 use crate::state::{AppState, ConnectionStatus, Inner};
@@ -195,6 +196,18 @@ fn land_decision(g: &Inner, hash: &str) -> LandDecision {
     }
 }
 
+/// 纯决策（可单测）：一次远端剪贴板到达是否应生成“远端到达”事件文件（交给 AI Relay 以 event_id 去重）。
+/// - Paused：暂停不可自动中继 → 否
+/// - Duplicate：内容相同但仍是新的远端任务 → 是（新 event_id；网络层已过滤真正重复包）
+/// - Proceed：仅当系统剪贴板真正写成功 → 是；写失败 → 否（不生成伪任务）
+fn should_emit_remote_event(land: LandDecision, clipboard_write_ok: bool) -> bool {
+    match land {
+        LandDecision::Paused => false,
+        LandDecision::Duplicate => true,
+        LandDecision::Proceed => clipboard_write_ok,
+    }
+}
+
 /// 远程文字落地（lib.rs 将之注入 NetworkManager）：
 /// 1. 暂停中则直接拒绝（暂停后不把新的远端内容写入本机剪贴板）
 /// 2. 内容与本机观察值一致则无需重复写入（哈希去重）
@@ -204,20 +217,28 @@ fn land_decision(g: &Inner, hash: &str) -> LandDecision {
 ///    写失败 → 撤销本次预先设置的 remote 标记（防回环），不留下陈旧 marker。
 pub fn land_remote(state: Arc<AppState>, app: AppHandle, payload: &protocol::ClipboardPayload) {
     let hash = payload.content_hash.clone();
-    {
+    let writer = RemoteClipboardWriter::new(RemoteClipboardWriter::default_path());
+    let decision = {
         let mut g = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-        match land_decision(&g, &hash) {
+        let d = land_decision(&g, &hash);
+        match d {
             LandDecision::Paused => return,
             LandDecision::Duplicate => {
                 g.last_sync = Some(now_millis_str());
-                return;
             }
-            LandDecision::Proceed => {}
+            LandDecision::Proceed => {
+                // 先标记远程写入，后写剪贴板：轮询线程在此期间读到新内容也不会回传
+                g.last_remote_hash = Some(hash.clone());
+            }
         }
-        // 先标记远程写入，后写剪贴板：轮询线程在此期间读到新内容也不会回传
-        g.last_remote_hash = Some(hash.clone());
+        d
+    };
+    // Duplicate：内容相同但仍是新的远端任务 → 生成新事件（新 event_id），交给 AI Relay 以 event_id 去重
+    if should_emit_remote_event(decision, false) {
+        writer.record(&payload.text, &hash);
+        return;
     }
-    // 真正写剪贴板前复查暂停（暂停落地竞态收口）：已暂停则撤销本次 marker 并退出
+    // Proceed：真正写剪贴板前复查暂停（暂停落地竞态收口）：已暂停则撤销本次 marker 并退出
     if state.inner.lock().map(|g| g.paused).unwrap_or(false) {
         let mut g = state.inner.lock().unwrap_or_else(|e| e.into_inner());
         clear_remote_marker_if_matches(&mut g, &hash);
@@ -225,17 +246,21 @@ pub fn land_remote(state: Arc<AppState>, app: AppHandle, payload: &protocol::Cli
     }
     if let Err(e) = write_clipboard_text(&payload.text) {
         tracing::warn!(%e, "远程剪贴板写入失败");
-        // 写失败必须撤销本次 marker（只清仍等于本次 hash 的，避免误删并发新 marker）
+        // 写失败必须撤销本次 marker（只清仍等于本次 hash 的，避免误删并发新 marker），且不生成事件
         let mut g = state.inner.lock().unwrap_or_else(|e| e.into_inner());
         clear_remote_marker_if_matches(&mut g, &hash);
         return;
     }
     {
         let mut g = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.last_clipboard_hash = Some(hash);
+        g.last_clipboard_hash = Some(hash.clone());
         g.last_clipboard_text = Some(payload.text.clone());
         g.last_remote_hash = None;
         g.last_sync = Some(now_millis_str());
+    }
+    // 剪贴板写成功 → 生成“远端到达”事件
+    if should_emit_remote_event(LandDecision::Proceed, true) {
+        writer.record(&payload.text, &hash);
     }
     let _ = app.emit(
         SYNCED_EVENT,
@@ -410,6 +435,20 @@ mod tests {
         g.last_clipboard_hash = Some("h-x".into());
         assert_eq!(land_decision(&g, "h-x"), LandDecision::Duplicate);
         assert_eq!(land_decision(&g, "h-y"), LandDecision::Proceed);
+    }
+
+    // L04-03：远端到达事件生成规则（与 land_remote 的实际分支一致）
+    #[test]
+    fn remote_event_decision_rule() {
+        // Paused：暂停不可自动中继 → 不生成事件（与剪贴板写结果无关）
+        assert!(!should_emit_remote_event(LandDecision::Paused, true));
+        assert!(!should_emit_remote_event(LandDecision::Paused, false));
+        // Duplicate：内容相同但仍是新的远端任务 → 生成新事件（与写结果无关）
+        assert!(should_emit_remote_event(LandDecision::Duplicate, false));
+        assert!(should_emit_remote_event(LandDecision::Duplicate, true));
+        // Proceed：仅系统剪贴板真正写成功才生成事件
+        assert!(should_emit_remote_event(LandDecision::Proceed, true));
+        assert!(!should_emit_remote_event(LandDecision::Proceed, false));
     }
 
     // T11-06 测试 3：RemoteEcho 防循环在 apply_observation 状态应用层继续成立：
