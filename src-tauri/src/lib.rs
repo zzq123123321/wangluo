@@ -3,6 +3,7 @@ mod clipboard;
 mod commands;
 pub mod config;
 pub mod error;
+mod external_status;
 pub mod identity;
 pub mod network;
 pub mod protocol;

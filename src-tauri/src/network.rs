@@ -4,6 +4,7 @@
 // 旧连接任务结束时必须仍是当前活动连接（generation 匹配 + settled 标记）才能影响状态。
 // 慢速网络 IO 与任务 join 一律在 AppState 锁外；std Mutex 持锁期间无 await。
 use crate::error::AppError;
+use crate::external_status::ExternalStatusWriter;
 use crate::protocol;
 use crate::state::{ConnectionStatus, PeerInfo};
 use serde::Serialize;
@@ -51,11 +52,26 @@ pub trait StatusSink: Send + Sync {
 
 pub struct TauriStatusSink {
     app: AppHandle,
+    /// 外部状态文件写入器（%LOCALAPPDATA%\ClipLink\status.json）：Mutex 保护“最近 RTT+代次”
+    /// 内存态与文件写，供 on_status/on_latency 跨任务共享。
+    ext: Mutex<ExternalStatusWriter>,
 }
 
 impl TauriStatusSink {
     pub fn new(app: AppHandle) -> Self {
-        Self { app }
+        let this = Self {
+            app,
+            ext: Mutex::new(ExternalStatusWriter::new(
+                ExternalStatusWriter::default_path(),
+            )),
+        };
+        // 启动即写一次状态文件（初始 offline / 无对端 / 无 RTT）：让 AI Relay 从进程一开始
+        // 就能读到合法文件，而不必等首个连接事件才出现。
+        this.ext
+            .lock()
+            .unwrap()
+            .record_status("offline", false, None, None, 0);
+        this
     }
 }
 
@@ -75,11 +91,59 @@ impl StatusSink for TauriStatusSink {
         let _ = self.app.emit(STATUS_EVENT, ev);
         // 阶段 9：连接/状态变化同步刷新托盘菜单“当前状态”项
         crate::tray::sync_from_state(&self.app);
+
+        // 外部状态文件：状态事件不携带新 RTT；仅 connected/paused 且与最近 RTT 同代次才保留，
+        // 其余（离线/连接中/重连/错误，或新代次尚未收到首笔 pong）一律清空 latency。
+        let is_connected_or_paused = matches!(
+            ev.status,
+            ConnectionStatus::Connected | ConnectionStatus::Paused
+        );
+        let status_str = status_to_str(ev.status);
+        let peer_name = ev.peer.as_ref().map(|p| p.device_name.as_str());
+        let peer_ip = ev.peer.as_ref().map(|p| p.ip.as_str());
+        self.ext.lock().unwrap().record_status(
+            &status_str,
+            is_connected_or_paused,
+            peer_name,
+            peer_ip,
+            ev.generation,
+        );
     }
 
     fn on_latency(&self, ev: &NetworkLatencyEvent) {
         let _ = self.app.emit(LATENCY_EVENT, ev);
+        // 外部状态文件：RTT 更新时从 AppState 取当前状态/对端，连同新 RTT/代次写文件。
+        // 短锁读取后立即释放，文件 IO 在锁外。
+        let (status_str, peer_name, peer_ip) = match self
+            .app
+            .try_state::<std::sync::Arc<crate::state::AppState>>()
+        {
+            Some(state) => match state.inner.lock() {
+                Ok(g) => (
+                    status_to_str(g.status),
+                    g.peer.as_ref().map(|p| p.device_name.clone()),
+                    g.peer.as_ref().map(|p| p.ip.clone()),
+                ),
+                Err(_) => (String::new(), None, None),
+            },
+            None => (String::new(), None, None),
+        };
+        self.ext.lock().unwrap().record_latency(
+            ev.latency_ms,
+            &status_str,
+            peer_name.as_deref(),
+            peer_ip.as_deref(),
+            ev.generation,
+        );
     }
+}
+
+/// ConnectionStatus 的 snake_case 字符串形式（与前端/状态文件一致：connected/paused/...）。
+fn status_to_str(s: ConnectionStatus) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
